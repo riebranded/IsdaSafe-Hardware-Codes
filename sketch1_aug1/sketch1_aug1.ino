@@ -188,6 +188,7 @@ struct SensorReadings {
   float waterTemp_C         = NAN;
   float ambientTemp_C       = NAN;
   float humidity_pct        = NAN;
+  float freeNh3_mgL         = NAN;   // un-ionized NH3, computed from NH3-N + pH + temp
 } readings;
 
 // Static pages. "First Page" (Water Temp, Air Temp, pH Level) is combined
@@ -325,6 +326,9 @@ static size_t wqHistCount = 0, wqHistNext = 0;
 
 static void wqFilterReset() { wqHistCount = 0; wqHistNext = 0; }
 
+// Last unfiltered values straight from the sensor (for frozen-value check).
+static float wqLastRawNh3 = NAN, wqLastRawPh = NAN;
+
 static void wqFilterPush(float nh3, float ph) {
   wqNh3Hist[wqHistNext] = nh3;
   wqPhHist[wqHistNext]  = ph;
@@ -390,6 +394,8 @@ bool readWaterQualitySensor() {
     readings.ammonia_mgL = rawNh3 / AMMONIA_SCALE;
     readings.ph          = rawPh  / PH_SCALE;
     readings.waterTemp_C = rawTmp / WTEMP_SCALE;
+    wqLastRawNh3 = readings.ammonia_mgL;
+    wqLastRawPh  = readings.ph;
     ok = true;
     break;
   }
@@ -893,11 +899,120 @@ bool pollDht(bool force = false) {
 // ---------------------------------------------------------------------------
 // Sensor polling
 // ---------------------------------------------------------------------------
+#if ENABLE_RS485
+// RS485 auto-recovery: after WQ_REINIT_AFTER failed reads in a row the UART
+// and DE/RE line are restarted; after WQ_DIAGNOSE_AFTER the full boot probe
+// (pins/baud/slave-ID scan) runs again. Fixes "only works after re-plugging".
+#define WQ_REINIT_AFTER    5
+#define WQ_DIAGNOSE_AFTER  20
+static uint16_t wqFailStreak = 0;
+
+static void wqRecoverIfNeeded(bool readOk) {
+  if (readOk) {
+    if (wqFailStreak >= WQ_REINIT_AFTER) Serial.println("[WQ] RS485 recovered.");
+    wqFailStreak = 0;
+    return;
+  }
+  wqFailStreak++;
+  if (wqFailStreak % WQ_DIAGNOSE_AFTER == 0) {
+    Serial.printf("[WQ] %u failed reads in a row - re-running RS485 auto-diagnose...\n", wqFailStreak);
+    rs485AutoDiagnose();
+  } else if (wqFailStreak % WQ_REINIT_AFTER == 0) {
+    Serial.printf("[WQ] %u failed reads in a row - restarting RS485 port.\n", wqFailStreak);
+    RS485Serial.end();
+#if RS485_USE_DE_RE
+    digitalWrite(RS485_DE_RE_PIN, LOW);
+#endif
+    delay(50);
+    RS485Serial.begin(RS485_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
+  }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Water-quality analysis, run after every reading:
+//  * Free (un-ionized) NH3 from total ammonia-N, pH and temperature
+//    (Emerson et al. 1975):  pKa = 0.09018 + 2729.92 / T(K)
+//    fraction = 1 / (1 + 10^(pKa - pH));  NH3 = NH3-N * fraction * 17/14
+//  * Alarm with hysteresis: ON after ALARM_CONFIRM readings above
+//    FREE_NH3_ALARM_ON, OFF after ALARM_CONFIRM readings below
+//    FREE_NH3_ALARM_OFF -- no flickering when hovering near the limit.
+//  * Warm-up: for WQ_WARMUP_MS after power-on the probe is still settling,
+//    so alarms are suppressed and nothing is uploaded.
+//  * Frozen-value check: if the sensor's raw NH3 AND pH haven't changed at
+//    all for WQ_STUCK_MS, warn (probe out of water or sensor hung).
+// ---------------------------------------------------------------------------
+#define FREE_NH3_ALARM_ON   0.05f    // mg/L un-ionized NH3
+#define FREE_NH3_ALARM_OFF  0.04f
+#define ALARM_CONFIRM       3        // consecutive readings to change state
+#define WQ_WARMUP_MS        (5UL * 60UL * 1000UL)
+#define WQ_STUCK_MS         (30UL * 60UL * 1000UL)
+
+bool freeNh3Alarm = false;
+bool wqStuck = false;
+static uint8_t alarmStreak = 0;
+static float stuckNh3 = NAN, stuckPh = NAN;
+static unsigned long stuckSinceMs = 0;
+
+float computeFreeNh3(float nh3N, float ph, float tempC) {
+  if (isnan(nh3N) || isnan(ph) || isnan(tempC)) return NAN;
+  float pKa = 0.09018f + 2729.92f / (tempC + 273.15f);
+  float fraction = 1.0f / (1.0f + powf(10.0f, pKa - ph));
+  return nh3N * fraction * (17.031f / 14.007f);
+}
+
+// Deep sleep restarts millis() on every wake, so warm-up would never end and
+// nothing would upload -- it only applies in continuous (no-sleep) mode.
+bool wqWarmingUp() { return !ENABLE_DEEP_SLEEP && millis() < WQ_WARMUP_MS; }
+
+void analyzeWaterQuality() {
+  readings.freeNh3_mgL = computeFreeNh3(readings.ammonia_mgL, readings.ph, readings.waterTemp_C);
+
+  // Alarm with hysteresis (suppressed during warm-up / missing data).
+  if (wqWarmingUp() || isnan(readings.freeNh3_mgL)) {
+    alarmStreak = 0;
+  } else {
+    bool wantChange = freeNh3Alarm ? (readings.freeNh3_mgL < FREE_NH3_ALARM_OFF)
+                                   : (readings.freeNh3_mgL > FREE_NH3_ALARM_ON);
+    alarmStreak = wantChange ? alarmStreak + 1 : 0;
+    if (alarmStreak >= ALARM_CONFIRM) {
+      freeNh3Alarm = !freeNh3Alarm;
+      alarmStreak = 0;
+      Serial.printf(freeNh3Alarm ? "[ALARM] Free NH3 HIGH: %.3f mg/L (> %.2f)\n"
+                                 : "[ALARM] Free NH3 back to normal: %.3f mg/L (< %.2f)\n",
+                    readings.freeNh3_mgL, freeNh3Alarm ? FREE_NH3_ALARM_ON : FREE_NH3_ALARM_OFF);
+    }
+  }
+
+#if ENABLE_RS485
+  // Frozen-value check on the unfiltered sensor values.
+  if (!isnan(wqLastRawNh3) && wqLastRawNh3 == stuckNh3 && wqLastRawPh == stuckPh) {
+    if (!wqStuck && millis() - stuckSinceMs >= WQ_STUCK_MS) {
+      wqStuck = true;
+      Serial.println("[WARN] SEN0711 NH3 and pH unchanged for 30 min - probe out of water or sensor hung?");
+    }
+  } else {
+    if (wqStuck) Serial.println("[WARN] SEN0711 values changing again.");
+    wqStuck = false;
+    stuckNh3 = wqLastRawNh3;
+    stuckPh  = wqLastRawPh;
+    stuckSinceMs = millis();
+  }
+#endif
+
+  if (wqWarmingUp()) {
+    unsigned long left = (WQ_WARMUP_MS - millis()) / 1000UL;
+    Serial.printf("[WARMUP] probe settling - %lu:%02lu left (alarms/uploads paused)\n", left / 60, left % 60);
+  }
+}
+
 void pollSensors() {
 #if ENABLE_RS485
-  if (!readWaterQualitySensor()) {
+  bool wqOk = readWaterQualitySensor();
+  if (!wqOk) {
     Serial.println("RS485 water quality sensor read failed/timed out.");
   }
+  wqRecoverIfNeeded(wqOk);
 #else
   Serial.println("RS485 disabled (ENABLE_RS485=0) - skipping pH/Ammonia/WaterTemp.");
 #endif
@@ -955,7 +1070,8 @@ void updateLcd() {
       printLine(1, "Oxygen:" + String(readings.dissolvedOxygen_mgL, 2) + "mg/L");
       break;
     case 2:
-      printLine(0, "Dissolved");
+      // Line 0: toxic free NH3 (+ "!" while the alarm is on); line 1: total.
+      printLine(0, "Free NH3:" + String(readings.freeNh3_mgL, 3) + (freeNh3Alarm ? " !" : ""));
       printLine(1, "Ammonia:" + String(readings.ammonia_mgL, 2) + "mg/L");
       break;
     case 3:
@@ -1110,12 +1226,14 @@ void runReadingCycle() {
 #if ENABLE_RS485
   wqBlankSample(readings.ammonia_mgL);   // no-op unless WQ BLANK is running
 #endif
+  analyzeWaterQuality();
   controlCooling(readings.waterTemp_C);
 
   // ID is the chip's factory ID the IsdaSafe website registers over USB.
   Serial.printf(
-    "DO=%.2f mg/L  pH=%.2f  NH3=%.2f mg/L  WaterT=%.1fC  AirT=%.1fC  Hum=%.0f%%  ID=%s\n",
+    "DO=%.2f mg/L  pH=%.2f  NH3=%.2f mg/L  FreeNH3=%.3f mg/L%s  WaterT=%.1fC  AirT=%.1fC  Hum=%.0f%%  ID=%s\n",
     readings.dissolvedOxygen_mgL, readings.ph, readings.ammonia_mgL,
+    readings.freeNh3_mgL, freeNh3Alarm ? " [ALARM]" : "",
     readings.waterTemp_C, readings.ambientTemp_C, readings.humidity_pct,
     deviceId().c_str()
   );
@@ -1123,8 +1241,12 @@ void runReadingCycle() {
   // Only upload path: Supabase ingest_sensor_reading() with the pairing
   // token. Missing values (NaN) are sent as null.
 #if ENABLE_UPLOAD
-  uploadReading(readings.dissolvedOxygen_mgL, readings.ph, readings.ammonia_mgL,
-                readings.waterTemp_C, readings.ambientTemp_C, readings.humidity_pct);
+  if (wqWarmingUp()) {
+    Serial.println("Warm-up: reading NOT uploaded (probe still settling).");
+  } else {
+    uploadReading(readings.dissolvedOxygen_mgL, readings.ph, readings.ammonia_mgL,
+                  readings.waterTemp_C, readings.ambientTemp_C, readings.humidity_pct);
+  }
 #else
   Serial.println("ENABLE_UPLOAD=0 (testing mode) - reading NOT sent to Supabase.");
 #endif
