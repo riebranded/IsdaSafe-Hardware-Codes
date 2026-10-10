@@ -125,15 +125,24 @@ static void handleSerialCommand(String line) {
 // Reads commands from the website. Call it often: from loop() and inside
 // every wait (see delayPollingDht in README.md), otherwise pairing can time
 // out while the board sits in a long delay().
+// A command runs on newline, or -- so the Serial Monitor's "No Line Ending"
+// setting also works -- 300 ms after its last character arrives.
+static unsigned long isdaLastCharMs = 0;
+
 inline void pollSerialCommands() {
   while (Serial.available()) {
     char c = (char)Serial.read();
+    isdaLastCharMs = millis();
     if (c == '\n' || c == '\r') {
       if (isdaCmdBuf.length() > 0) handleSerialCommand(isdaCmdBuf);
       isdaCmdBuf = "";
     } else if (isdaCmdBuf.length() < 128) {
       isdaCmdBuf += c;
     }
+  }
+  if (isdaCmdBuf.length() > 0 && millis() - isdaLastCharMs > 300) {
+    handleSerialCommand(isdaCmdBuf);
+    isdaCmdBuf = "";
   }
 }
 

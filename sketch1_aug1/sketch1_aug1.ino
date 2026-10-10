@@ -159,10 +159,10 @@
 // ---------------------------------------------------------------------------
 #define DO_TWO_POINT_CALIBRATION 1
 
-#define DO_CAL1_V   1409   // mV reading at calibration point 1
+#define DO_CAL1_V   647   // mV reading at calibration point 1
 #define DO_CAL1_T   30     // water temp (C) at calibration point 1
-#define DO_CAL2_V   1300   // mV reading at calibration point 2 (two-point only)
-#define DO_CAL2_T   15     // water temp (C) at calibration point 2 (two-point only)
+#define DO_CAL2_V   365   // mV reading at calibration point 2 (two-point only)
+#define DO_CAL2_T   19     // water temp (C) at calibration point 2 (two-point only)
 
 // Saturated DO (mg/L) in fresh water at 1 atm, index = temperature 0-40 C.
 // Same values as DFRobot's SEN0237 example (which stores them in ug/L) and
@@ -832,7 +832,12 @@ void handleAppSerialCommand(const String &line) {
   String cmd = line;
   cmd.trim();
   cmd.toUpperCase();
-  if (cmd.startsWith("WQ")) wqPendingCmd = cmd;
+  if (cmd.startsWith("WQ")) {
+    wqPendingCmd = cmd;
+    Serial.println("[WQ] received: " + cmd + " (runs after the current reading)");
+  } else {
+    Serial.println("[WQ] unknown command: " + cmd + " (type WQ for the list)");
+  }
 #endif
 }
 
