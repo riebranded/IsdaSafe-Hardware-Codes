@@ -2,11 +2,11 @@
   DO_Calibration - ESP32 + ADS1115 version of DFRobot's SEN0237-A
   calibration example (originally analogRead(A1) on an UNO).
 
-  Also reads the board's DHT22 alongside the DO probe, so you get a live
-  temperature reading printed next to the voltage -- no separate
-  thermometer needed. Since calibration is done in air (or saturated
-  water), the DHT22's ambient temperature is exactly what you want to
-  record as DO_CAL1_T / DO_CAL2_T.
+  Also prints a live temperature next to the voltage: the WATER
+  temperature from the SEN0711 (put it in the same cup as the DO probe for
+  saturated-water / two-point calibration), falling back to the DHT22's
+  AIR temperature if the SEN0711 doesn't answer (fine for the in-air
+  method). Record it as DO_CAL1_T / DO_CAL2_T.
 
   Use this exactly like the documented UNO procedure:
    1. Upload this sketch, open Serial Monitor at 115200 baud.
@@ -44,12 +44,63 @@
 #define DHT_PIN      15
 #define DHT_TYPE     DHT22
 
+// SEN0711 (same RS485 wiring as sketch1_aug1): used only for its WATER
+// temperature, which is what two-point / saturated-water calibration needs.
+// The DHT22 measures AIR and is used only if the SEN0711 doesn't answer.
+#define RS485_RX_PIN     16
+#define RS485_TX_PIN     17
+#define RS485_DE_RE_PIN  32
+#define RS485_BAUD       4800
+#define WQ_SLAVE_ID      1
+
 Adafruit_ADS1115 ads;
 DHT dht(DHT_PIN, DHT_TYPE);
+HardwareSerial RS485Serial(1);
+
+static uint16_t modbusCrc16(const uint8_t* d, size_t n) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < n; i++) {
+    crc ^= d[i];
+    for (int b = 0; b < 8; b++) crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+  }
+  return crc;
+}
+
+// Reads SEN0711 register 0x0002 (water temp x10, signed). NAN if no reply.
+float readWaterTemp() {
+  uint8_t req[8] = { WQ_SLAVE_ID, 0x03, 0x00, 0x02, 0x00, 0x01 };
+  uint16_t crc = modbusCrc16(req, 6);
+  req[6] = crc & 0xFF; req[7] = crc >> 8;
+  while (RS485Serial.available()) RS485Serial.read();
+  digitalWrite(RS485_DE_RE_PIN, HIGH);
+  delayMicroseconds(100);
+  RS485Serial.write(req, sizeof(req));
+  RS485Serial.flush();
+  delayMicroseconds(100);
+  digitalWrite(RS485_DE_RE_PIN, LOW);
+
+  uint8_t buf[24]; size_t n = 0;
+  unsigned long t0 = millis();
+  while (millis() - t0 < 300 && n < sizeof(buf)) {
+    if (RS485Serial.available()) buf[n++] = RS485Serial.read();
+  }
+  // Reply: 01 03 02 [T hi] [T lo] [CRC lo] [CRC hi]
+  for (size_t i = 0; i + 7 <= n; i++) {
+    if (buf[i] == WQ_SLAVE_ID && buf[i + 1] == 0x03 && buf[i + 2] == 0x02 &&
+        modbusCrc16(&buf[i], 5) == (uint16_t)(buf[i + 5] | (buf[i + 6] << 8))) {
+      return (int16_t)((buf[i + 3] << 8) | buf[i + 4]) / 10.0f;
+    }
+  }
+  return NAN;
+}
 
 void setup() {
   Serial.begin(115200);
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+  pinMode(RS485_DE_RE_PIN, OUTPUT);
+  digitalWrite(RS485_DE_RE_PIN, LOW);
+  RS485Serial.begin(RS485_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
 
   if (!ads.begin(ADS1115_ADDR)) {
     Serial.println("ADS1115 not found - check wiring/address.");
@@ -68,7 +119,7 @@ void setup() {
 #define CAPTURE_MAX_DRIFT_MV 10.0f   // first-10s vs last-10s mean; above = not stable
 
 int      capPoint = 0;               // 0 = idle, 1 or 2 = capturing that point
-uint16_t capTotal = 0, capN = 0, capTempN = 0;
+uint16_t capTotal = 0, capN = 0, capTempN = 0, capWaterN = 0;
 double   capSumMv = 0, capSumSqMv = 0, capSumT = 0;
 float    capMinMv = 0, capMaxMv = 0;
 double   capFirstSum = 0, capLastSum = 0;
@@ -80,7 +131,7 @@ void startCapture(int point, int seconds) {
   halted = false;
   capPoint = point;
   capTotal = seconds;
-  capN = capTempN = 0;
+  capN = capTempN = capWaterN = 0;
   capSumMv = capSumSqMv = capSumT = 0;
   capFirstSum = capLastSum = 0;
   capFirstN = capLastN = 0;
@@ -112,8 +163,13 @@ void finishCapture() {
                   point, lroundf(avgMv), point);
   } else {
     float avgT = capSumT / capTempN;
-    Serial.printf(">>> mean temperature (DHT22 = air) = %.1f C\n", avgT);
-    Serial.println(">>> (Saturated-water method: use the WATER temperature instead.)");
+    if (capWaterN == capTempN) {
+      Serial.printf(">>> mean WATER temperature (SEN0711) = %.1f C\n", avgT);
+    } else {
+      Serial.printf(">>> mean temperature = %.1f C  (%u of %u readings were AIR temp from the DHT22 -\n",
+                    avgT, capTempN - capWaterN, capTempN);
+      Serial.println(">>>  SEN0711 not answering. For water calibration, measure the water temp yourself.)");
+    }
     Serial.printf(">>> Paste into sketch1_aug1.ino:\n#define DO_CAL%d_V   %ld\n#define DO_CAL%d_T   %ld\n",
                   point, lroundf(avgMv), point, lroundf(avgT));
   }
@@ -171,14 +227,18 @@ void loop() {
 
   int16_t raw = ads.readADC_SingleEnded(0);
   float voltage_mV = ads.computeVolts(raw) * 1000.0f;
-  float tempC = dht.readTemperature();
+  // Water temperature from the SEN0711; air temperature (DHT22) only as a fallback.
+  float tempC = readWaterTemp();
+  bool tempIsWater = !isnan(tempC);
+  if (!tempIsWater) tempC = dht.readTemperature();
 
   Serial.print("raw:\t" + String(raw) + "\tVoltage(mv):\t" + String(voltage_mV, 1));
   if (isnan(tempC)) {
     Serial.print("\tTemp(C):\tread failed");
   } else {
-    Serial.print("\tTemp(C):\t" + String(tempC, 1));
+    Serial.print(String(tempIsWater ? "\tWaterTemp(C):\t" : "\tAirTemp(C):\t") + String(tempC, 1));
   }
+  if (capPoint && tempIsWater) capWaterN++;
 
   if (capPoint) {
     if (capN == 0 || voltage_mV < capMinMv) capMinMv = voltage_mV;
