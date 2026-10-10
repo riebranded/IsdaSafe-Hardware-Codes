@@ -120,7 +120,7 @@ void setup() {
 
 int      capPoint = 0;               // 0 = idle, 1 or 2 = capturing that point
 uint16_t capTotal = 0, capN = 0, capTempN = 0, capWaterN = 0;
-double   capSumMv = 0, capSumSqMv = 0, capSumT = 0;
+double   capSumMv = 0, capSumSqMv = 0, capSumT = 0, capSumWaterT = 0;
 float    capMinMv = 0, capMaxMv = 0;
 double   capFirstSum = 0, capLastSum = 0;
 uint16_t capFirstN = 0, capLastN = 0;
@@ -132,7 +132,7 @@ void startCapture(int point, int seconds) {
   capPoint = point;
   capTotal = seconds;
   capN = capTempN = capWaterN = 0;
-  capSumMv = capSumSqMv = capSumT = 0;
+  capSumMv = capSumSqMv = capSumT = capSumWaterT = 0;
   capFirstSum = capLastSum = 0;
   capFirstN = capLastN = 0;
   Serial.printf(">>> Capturing calibration point %d: averaging for %d s - keep the probe still...\n",
@@ -162,13 +162,18 @@ void finishCapture() {
     Serial.printf(">>> Paste into sketch1_aug1.ino:\n#define DO_CAL%d_V   %ld\n#define DO_CAL%d_T   <temp C>\n",
                   point, lroundf(avgMv), point);
   } else {
-    float avgT = capSumT / capTempN;
-    if (capWaterN == capTempN) {
-      Serial.printf(">>> mean WATER temperature (SEN0711) = %.1f C\n", avgT);
+    // Never mix air (DHT22 fallback) and water temperatures: if the SEN0711
+    // answered at all, average only its water readings.
+    float avgT;
+    if (capWaterN > 0) {
+      avgT = capSumWaterT / capWaterN;
+      Serial.printf(">>> mean WATER temperature (SEN0711) = %.1f C  (%u water readings", avgT, capWaterN);
+      if (capWaterN < capTempN) Serial.printf("; %u air-temp fallbacks ignored", capTempN - capWaterN);
+      Serial.println(")");
     } else {
-      Serial.printf(">>> mean temperature = %.1f C  (%u of %u readings were AIR temp from the DHT22 -\n",
-                    avgT, capTempN - capWaterN, capTempN);
-      Serial.println(">>>  SEN0711 not answering. For water calibration, measure the water temp yourself.)");
+      avgT = capSumT / capTempN;
+      Serial.printf(">>> mean AIR temperature (DHT22) = %.1f C - SEN0711 never answered.\n", avgT);
+      Serial.println(">>> For water calibration, measure the water temperature yourself.");
     }
     Serial.printf(">>> Paste into sketch1_aug1.ino:\n#define DO_CAL%d_V   %ld\n#define DO_CAL%d_T   %ld\n",
                   point, lroundf(avgMv), point, lroundf(avgT));
@@ -238,7 +243,7 @@ void loop() {
   } else {
     Serial.print(String(tempIsWater ? "\tWaterTemp(C):\t" : "\tAirTemp(C):\t") + String(tempC, 1));
   }
-  if (capPoint && tempIsWater) capWaterN++;
+  if (capPoint && tempIsWater) { capWaterN++; capSumWaterT += tempC; }
 
   if (capPoint) {
     if (capN == 0 || voltage_mV < capMinMv) capMinMv = voltage_mV;
