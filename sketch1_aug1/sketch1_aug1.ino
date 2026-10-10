@@ -598,7 +598,14 @@ static bool wqTransact(const uint8_t* req, size_t reqLen, uint8_t* resp, size_t 
       return false;
     }
   }
-  Serial.printf("[WQ] no valid reply (%u byte(s) heard)\n", (unsigned)n);
+  Serial.printf("[WQ] no valid reply (%u byte(s) heard)", (unsigned)n);
+  if (n) {
+    Serial.print(": ");
+    for (size_t i = 0; i < n; i++) Serial.printf("%02X ", buf[i]);
+    Serial.print(" | sent: ");
+    for (size_t i = 0; i < reqLen; i++) Serial.printf("%02X ", req[i]);
+  }
+  Serial.println();
   return false;
 }
 
@@ -654,6 +661,7 @@ static void wqPrintHelp() {
   Serial.println(F("[WQ]   WQ OFFSETS          read stored temp/pH/NH3 offsets"));
   Serial.println(F("[WQ]   WQ CLEARNH3         set the NH3 offset (0x0052) to 0"));
   Serial.println(F("[WQ]   WQ SETNH3 <mg/L>    set the NH3 offset by hand, e.g. WQ SETNH3 -1.50"));
+  Serial.println(F("[WQ]   WQ SETPH <pH>       set the pH offset by hand, e.g. WQ SETPH 0.66 (0 clears)"));
   Serial.println(F("[WQ]   WQ ZERONH3          probe in DISTILLED water -> make current NH3 read 0.00"));
   Serial.println(F("[WQ]   WQ BLANK [minutes]  same, but averages every reading for 15 min (default)"));
   Serial.println(F("[WQ]   WQ CANCEL           stop a running WQ BLANK without changing anything"));
@@ -786,6 +794,21 @@ static void runPendingWqCommand() {
     long raw = lroundf(mgL * 100.0f);
     bool ok = wqWriteReg(0x0052, (uint16_t)(int16_t)raw);
     Serial.printf("[WQ] Set NH3 offset to %+.2f mg/L: %s\n", raw / 100.0f, ok ? "OK" : "FAILED");
+    wqReadOffsets();
+  } else if (cmd.startsWith("WQ SETPH ")) {
+    // Manual pH offset (register 0x0051, x100): the sensor ADDS it to every
+    // pH reading. E.g. a 9.18 buffer reading 8.52 -> WQ SETPH 0.66.
+    String arg = cmd.substring(9);
+    arg.trim();
+    float ph = arg.toFloat();
+    if (arg.length() == 0 || (ph == 0.0f && arg[0] != '0' && arg[0] != '-' && arg[0] != '+' && arg[0] != '.') ||
+        ph < -5.0f || ph > 5.0f) {
+      Serial.println("[WQ] usage: WQ SETPH <pH>   (-5 to 5, e.g. WQ SETPH 0.66; WQ SETPH 0 clears it)");
+      return;
+    }
+    long raw = lroundf(ph * 100.0f);
+    bool ok = wqWriteReg(0x0051, (uint16_t)(int16_t)raw);
+    Serial.printf("[WQ] Set pH offset to %+.2f: %s\n", raw / 100.0f, ok ? "OK" : "FAILED");
     wqReadOffsets();
   } else if (cmd == "WQ ZERONH3") {
     // Quick blank: average 10 readings (~5 s) in ammonia-free water.
@@ -953,7 +976,8 @@ static void wqRecoverIfNeeded(bool readOk) {
 #define FREE_NH3_ALARM_ON   0.05f    // mg/L un-ionized NH3
 #define FREE_NH3_ALARM_OFF  0.04f
 #define ALARM_CONFIRM       3        // consecutive readings to change state
-#define WQ_WARMUP_MS        (5UL * 60UL * 1000UL)
+// TESTING: warm-up off (0). For deployment use (5UL * 60UL * 1000UL) = 5 min.
+#define WQ_WARMUP_MS        0UL
 #define WQ_STUCK_MS         (30UL * 60UL * 1000UL)
 
 bool freeNh3Alarm = false;
