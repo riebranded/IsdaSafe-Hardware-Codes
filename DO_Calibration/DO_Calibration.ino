@@ -56,6 +56,8 @@ void setup() {
   }
 
   dht.begin();
+  Serial.println(">>> DO_Calibration ready. When the voltage is stable, type 1 (point 1) or 2 (point 2)");
+  Serial.println(">>> and press Enter to average it over 60 s (e.g. \"1 120\" for 120 s).");
 }
 
 // ---------------------------------------------------------------------------
@@ -118,26 +120,43 @@ void finishCapture() {
   Serial.flush();
 }
 
+void runCommand() {
+  cmdBuf.trim();
+  if (cmdBuf.length()) Serial.println(">>> Received: " + cmdBuf);
+  if (cmdBuf.equalsIgnoreCase("r")) {
+    halted = false;
+    Serial.println(">>> Resumed live readings.");
+  } else if (cmdBuf.length()) {
+    int point = cmdBuf.toInt();
+    int sp = cmdBuf.indexOf(' ');
+    int secs = sp > 0 ? cmdBuf.substring(sp + 1).toInt() : CAPTURE_DEFAULT_S;
+    if ((point == 1 || point == 2) && secs >= 10 && secs <= 600) {
+      startCapture(point, secs);
+    } else {
+      Serial.println(">>> Type 1 or 2 (optionally followed by seconds, e.g. \"1 120\").");
+    }
+  }
+  cmdBuf = "";
+}
+
+// Works with any Serial Monitor line-ending setting: a command runs on
+// Enter (newline), or 300 ms after the last character if no newline is sent.
+unsigned long lastCharMs = 0;
+
 void pollCommands() {
   while (Serial.available()) {
     char c = (char)Serial.read();
-    if (c != '\n' && c != '\r') { if (cmdBuf.length() < 32) cmdBuf += c; continue; }
-    cmdBuf.trim();
-    if (cmdBuf.equalsIgnoreCase("r")) {
-      halted = false;
-      Serial.println(">>> Resumed live readings.");
-    } else if (cmdBuf.length()) {
-      int point = cmdBuf.toInt();
-      int sp = cmdBuf.indexOf(' ');
-      int secs = sp > 0 ? cmdBuf.substring(sp + 1).toInt() : CAPTURE_DEFAULT_S;
-      if ((point == 1 || point == 2) && secs >= 10 && secs <= 600) {
-        startCapture(point, secs);
-      } else {
-        Serial.println(">>> Type 1 or 2 (optionally followed by seconds, e.g. \"1 120\").");
-      }
-    }
-    cmdBuf = "";
+    lastCharMs = millis();
+    if (c == '\n' || c == '\r') { runCommand(); continue; }
+    if (cmdBuf.length() < 32) cmdBuf += c;
   }
+  if (cmdBuf.length() && millis() - lastCharMs > 300) runCommand();
+}
+
+// delay() that keeps listening for commands.
+void waitPolling(unsigned long ms) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < ms) { pollCommands(); delay(10); }
 }
 
 void loop() {
@@ -169,5 +188,5 @@ void loop() {
     Serial.println();
   }
 
-  delay(1000);
+  waitPolling(1000);
 }
