@@ -598,6 +598,17 @@ static bool wqTransact(const uint8_t* req, size_t reqLen, uint8_t* resp, size_t 
       return false;
     }
   }
+  // The SEN0711 also answers a refused calibration write with a non-standard
+  // 8-byte frame carrying the error flag, e.g. 01 90 11 00 00 01 05 2B.
+  for (size_t i = 0; i + 2 <= n; i++) {
+    if (buf[i] == req[0] && buf[i + 1] == (req[1] | 0x80)) {
+      Serial.print("[WQ] sensor REJECTED the command (error reply 0x");
+      Serial.printf("%02X): ", buf[i + 1]);
+      for (size_t j = i; j < n; j++) Serial.printf("%02X ", buf[j]);
+      Serial.println();
+      return false;
+    }
+  }
   Serial.printf("[WQ] no valid reply (%u byte(s) heard)", (unsigned)n);
   if (n) {
     Serial.print(": ");
