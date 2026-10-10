@@ -58,6 +58,7 @@ void setup() {
   dht.begin();
   Serial.println(">>> DO_Calibration ready. When the voltage is stable, type 1 (point 1) or 2 (point 2)");
   Serial.println(">>> and press Enter to average it over 60 s (e.g. \"1 120\" for 120 s).");
+  Serial.println(">>> s = stop readings (also cancels a capture), r = resume.");
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +127,11 @@ void runCommand() {
   if (cmdBuf.equalsIgnoreCase("r")) {
     halted = false;
     Serial.println(">>> Resumed live readings.");
+  } else if (cmdBuf.equalsIgnoreCase("s") || cmdBuf.equalsIgnoreCase("stop")) {
+    if (capPoint) Serial.printf(">>> Capture of point %d CANCELLED - nothing recorded.\n", capPoint);
+    capPoint = 0;
+    halted = true;
+    Serial.println(">>> Readings STOPPED. Type r to resume, or 1 / 2 for a capture.");
   } else if (cmdBuf.length()) {
     int point = cmdBuf.toInt();
     int sp = cmdBuf.indexOf(' ');
@@ -133,7 +139,7 @@ void runCommand() {
     if ((point == 1 || point == 2) && secs >= 10 && secs <= 600) {
       startCapture(point, secs);
     } else {
-      Serial.println(">>> Type 1 or 2 (optionally followed by seconds, e.g. \"1 120\").");
+      Serial.println(">>> Commands: 1 / 2 [seconds] = capture point, s = stop, r = resume.");
     }
   }
   cmdBuf = "";
