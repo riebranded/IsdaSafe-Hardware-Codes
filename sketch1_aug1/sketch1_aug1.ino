@@ -252,7 +252,11 @@ void printPinConfig() {
 
 // TESTING: set ENABLE_UPLOAD to 0 to read sensors and print to Serial/LCD
 // only, without sending anything to Supabase. Set back to 1 when deploying.
-#define ENABLE_UPLOAD           0
+#define ENABLE_UPLOAD           1
+// Continuous mode (ENABLE_DEEP_SLEEP 0) reads every 2 s; uploading that often
+// would flood the database, so only one reading per UPLOAD_INTERVAL_MS is
+// sent (the first one right after boot). Deep-sleep mode uploads every wake.
+#define UPLOAD_INTERVAL_MS      60000UL
 
 #define READING_INTERVAL_MIN   1
 #define uS_TO_S_FACTOR          1000000ULL
@@ -1287,8 +1291,19 @@ void runReadingCycle() {
   if (wqWarmingUp()) {
     Serial.println("Warm-up: reading NOT uploaded (probe still settling).");
   } else {
-    uploadReading(readings.dissolvedOxygen_mgL, readings.ph, readings.ammonia_mgL,
-                  readings.waterTemp_C, readings.ambientTemp_C, readings.humidity_pct);
+#if !ENABLE_DEEP_SLEEP
+    static bool uploadedOnce = false;
+    static unsigned long lastUploadMs = 0;
+    if (!uploadedOnce || millis() - lastUploadMs >= UPLOAD_INTERVAL_MS) {
+#endif
+      if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
+      uploadReading(readings.dissolvedOxygen_mgL, readings.ph, readings.ammonia_mgL,
+                    readings.waterTemp_C, readings.ambientTemp_C, readings.humidity_pct);
+#if !ENABLE_DEEP_SLEEP
+      uploadedOnce = true;
+      lastUploadMs = millis();
+    }
+#endif
   }
 #else
   Serial.println("ENABLE_UPLOAD=0 (testing mode) - reading NOT sent to Supabase.");
