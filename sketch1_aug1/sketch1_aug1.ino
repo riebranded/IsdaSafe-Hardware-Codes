@@ -121,13 +121,18 @@
 
 // ---------------------------------------------------------------------------
 // DRV8833 cooling fan (3V 1000RPM DC motor, one channel)
-// Board's "Sleep" pin is left unconnected (relies on the board's own
-// onboard pull-up jumper to stay enabled) -- set MOTOR_STBY_CONNECTED to 1
-// and pick a free GPIO for MOTOR_STBY_PIN if you wire it up later for
-// deep-sleep power savings.
+// Wiring (board with only IN1/IN2 inputs -- its sleep/enable is tied on
+// internally, so nothing else is needed):
+//   ESP32 GPIO18 -> IN1      ESP32 GPIO2 -> IN2
+//   Motor        -> OUT1 / OUT2
+//   VCC/VM       -> 5 V (or 3.3 V) supply,  GND -> ESP32 GND (must be shared)
+// The fan runs automatically only when water >= COOLING_ON_TEMP. To test it
+// at any temperature type FAN ON / FAN 50 (percent) / FAN OFF / FAN AUTO in
+// the Serial Monitor. MOTOR_STBY_CONNECTED is only for boards that expose a
+// Sleep/STBY pin.
 // ---------------------------------------------------------------------------
-#define MOTOR_AIN1_PIN   19   // -> DRV8833 IN1 (moved off GPIO17 -- that pin is taken by the TTL module's TX wire)
-#define MOTOR_AIN2_PIN   18   // -> DRV8833 IN2
+#define MOTOR_AIN1_PIN   18   // -> DRV8833 IN1 (moved off GPIO17 -- that pin is taken by the TTL module's TX wire)
+#define MOTOR_AIN2_PIN   2   // -> DRV8833 IN2
 #define MOTOR_STBY_CONNECTED 0
 #define MOTOR_STBY_PIN   4    // -> DRV8833 Sleep, only used if MOTOR_STBY_CONNECTED=1
 
@@ -144,6 +149,15 @@
 // verify the motor/wiring works. Set back to 0 once RS485 is restored.
 #define FORCE_FAN_TEST      0
 #define FORCE_FAN_TEST_DUTY 180  // 0-255, must be >= COOLING_MIN_DUTY to actually spin
+
+// Spins the fan briefly at boot so you can confirm the motor and wiring work.
+#define FAN_BOOT_TEST_MS    2000
+// A DC motor often won't start from standstill at low duty; give it this
+// long at full power first, then drop to the requested duty.
+#define FAN_KICK_MS         150
+
+int fanOverride = -1;      // -1 = automatic (temperature); 0-255 = FAN command
+uint8_t fanDuty = 0;       // duty currently applied to IN1
 
 // ---------------------------------------------------------------------------
 // Dissolved Oxygen calibration (DFRobot SEN0237-A method).
@@ -870,11 +884,13 @@ void handleAppSerialCommand(const String &line) {
   String cmd = line;
   cmd.trim();
   cmd.toUpperCase();
-  if (cmd.startsWith("WQ")) {
+  if (cmd == "FAN" || cmd.startsWith("FAN ")) {
+    handleFanCommand(cmd);
+  } else if (cmd.startsWith("WQ")) {
     wqPendingCmd = cmd;
     Serial.println("[WQ] received: " + cmd + " (runs after the current reading)");
   } else {
-    Serial.println("[WQ] unknown command: " + cmd + " (type WQ for the list)");
+    Serial.println("[WQ] unknown command: " + cmd + " (type WQ for the list; FAN ON|OFF|AUTO|<0-100> for the fan)");
   }
 #endif
 }
@@ -1073,8 +1089,28 @@ void pollSensors() {
 // ---------------------------------------------------------------------------
 // Cooling fan control (DRV8833, one channel, forward-only speed control)
 // ---------------------------------------------------------------------------
+void setFanDuty(uint8_t duty) {
+  if (duty > 0 && fanDuty == 0) {
+    ledcWrite(MOTOR_AIN1_PIN, 255);   // kick-start
+    ledcWrite(MOTOR_AIN2_PIN, 0);
+    delay(FAN_KICK_MS);
+  }
+  ledcWrite(MOTOR_AIN1_PIN, duty);    // IN1 = PWM, IN2 = low -> forward
+  ledcWrite(MOTOR_AIN2_PIN, 0);
+  if (duty != fanDuty) {
+    Serial.printf("[FAN] %s (duty %u/255 = %u%%)\n", duty ? "ON" : "OFF",
+                  duty, (unsigned)(duty * 100U / 255U));
+  }
+  fanDuty = duty;
+}
+
 void controlCooling(float waterTempC) {
   uint8_t duty = 0;
+
+  if (fanOverride >= 0) {
+    setFanDuty((uint8_t)fanOverride);   // manual FAN command
+    return;
+  }
 
 #if FORCE_FAN_TEST
   duty = FORCE_FAN_TEST_DUTY; // ignore temperature entirely -- test mode
@@ -1087,8 +1123,31 @@ void controlCooling(float waterTempC) {
   }
 #endif
 
-  ledcWrite(MOTOR_AIN1_PIN, duty);
-  ledcWrite(MOTOR_AIN2_PIN, 0);
+  setFanDuty(duty);
+}
+
+// FAN ON | FAN OFF | FAN AUTO | FAN <0-100 percent>
+void handleFanCommand(String cmd) {
+  String arg = cmd.substring(3);
+  arg.trim();
+  if (arg == "ON") {
+    fanOverride = 255;
+  } else if (arg == "OFF") {
+    fanOverride = 0;
+  } else if (arg == "AUTO" || arg.length() == 0) {
+    fanOverride = -1;
+  } else {
+    int pct = constrain(arg.toInt(), 0, 100);
+    fanOverride = pct * 255 / 100;
+  }
+  if (fanOverride < 0) {
+    Serial.printf("[FAN] AUTO: runs when water >= %.0f C (now %.1f C)\n",
+                  COOLING_ON_TEMP, readings.waterTemp_C);
+    controlCooling(readings.waterTemp_C);
+  } else {
+    Serial.println("[FAN] manual override (type FAN AUTO to return to temperature control)");
+    setFanDuty((uint8_t)fanOverride);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1250,6 +1309,14 @@ void setup() {
   // DRV8833 board's onboard pull-up jumper to stay enabled.
   ledcAttach(MOTOR_AIN1_PIN, PWM_FREQ_HZ, PWM_RESOLUTION);
   ledcAttach(MOTOR_AIN2_PIN, PWM_FREQ_HZ, PWM_RESOLUTION);
+  ledcWrite(MOTOR_AIN2_PIN, 0);
+#if FAN_BOOT_TEST_MS > 0
+  Serial.println("[FAN] boot test: motor should spin now...");
+  setFanDuty(255);
+  delayPollingDht(FAN_BOOT_TEST_MS);
+  setFanDuty(0);
+  Serial.println("[FAN] boot test done. Didn't spin? Check VCC/VM power, shared GND, OUT1/OUT2.");
+#endif
 
   runReadingCycle();
 
