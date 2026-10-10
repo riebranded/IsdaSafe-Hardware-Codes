@@ -595,6 +595,7 @@ static void wqPrintHelp() {
   Serial.println(F("[WQ] Serial Monitor commands (set line ending to Newline):"));
   Serial.println(F("[WQ]   WQ OFFSETS          read stored temp/pH/NH3 offsets"));
   Serial.println(F("[WQ]   WQ CLEARNH3         set the NH3 offset (0x0052) to 0"));
+  Serial.println(F("[WQ]   WQ SETNH3 <mg/L>    set the NH3 offset by hand, e.g. WQ SETNH3 -1.50"));
   Serial.println(F("[WQ]   WQ ZERONH3          probe in DISTILLED water -> make current NH3 read 0.00"));
   Serial.println(F("[WQ]   WQ BLANK [minutes]  same, but averages every reading for 15 min (default)"));
   Serial.println(F("[WQ]   WQ CANCEL           stop a running WQ BLANK without changing anything"));
@@ -712,6 +713,21 @@ static void runPendingWqCommand() {
     wqReadOffsets();
   } else if (cmd == "WQ CLEARNH3") {
     Serial.println(wqWriteReg(0x0052, 0) ? "[WQ] NH3 offset cleared." : "[WQ] clearing NH3 offset FAILED");
+    wqReadOffsets();
+  } else if (cmd.startsWith("WQ SETNH3 ")) {
+    // Manual offset: the sensor ADDS this to every ammonia reading
+    // (negative lowers the readings).
+    String arg = cmd.substring(10);
+    arg.trim();
+    float mgL = arg.toFloat();
+    if (arg.length() == 0 || (mgL == 0.0f && arg[0] != '0' && arg[0] != '-' && arg[0] != '+' && arg[0] != '.') ||
+        mgL < -100.0f || mgL > 100.0f) {
+      Serial.println("[WQ] usage: WQ SETNH3 <mg/L>   (-100 to 100, e.g. WQ SETNH3 -1.50)");
+      return;
+    }
+    long raw = lroundf(mgL * 100.0f);
+    bool ok = wqWriteReg(0x0052, (uint16_t)(int16_t)raw);
+    Serial.printf("[WQ] Set NH3 offset to %+.2f mg/L: %s\n", raw / 100.0f, ok ? "OK" : "FAILED");
     wqReadOffsets();
   } else if (cmd == "WQ ZERONH3") {
     // Quick blank: average 10 readings (~5 s) in ammonia-free water.
