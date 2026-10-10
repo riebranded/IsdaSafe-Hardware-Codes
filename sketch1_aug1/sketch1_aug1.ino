@@ -142,7 +142,7 @@
 // temperature-based logic below can never turn the fan on. Set this to 1 to
 // force the fan to spin at a fixed test duty regardless of temperature, to
 // verify the motor/wiring works. Set back to 0 once RS485 is restored.
-#define FORCE_FAN_TEST      1
+#define FORCE_FAN_TEST      0
 #define FORCE_FAN_TEST_DUTY 180  // 0-255, must be >= COOLING_MIN_DUTY to actually spin
 
 // ---------------------------------------------------------------------------
