@@ -1298,7 +1298,7 @@ void runReadingCycle() {
 #endif
       if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
       uploadReading(readings.dissolvedOxygen_mgL, readings.ph, readings.ammonia_mgL,
-                    readings.waterTemp_C, readings.ambientTemp_C, readings.humidity_pct);
+                    readings.freeNh3_mgL, readings.waterTemp_C, readings.ambientTemp_C, readings.humidity_pct);
 #if !ENABLE_DEEP_SLEEP
       uploadedOnce = true;
       lastUploadMs = millis();

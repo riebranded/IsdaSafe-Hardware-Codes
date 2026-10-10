@@ -153,8 +153,11 @@ static String jsonNumber(float v, int decimals = 2) {
 
 // Uploads one reading to the account this device is paired to. Returns
 // true on success. Any value may be NAN (sent as null).
+// ammonia = total ammonia nitrogen (TAN, as measured); freeAmmonia = free
+// NH3 computed from TAN, pH and water temperature.
 inline bool uploadReading(float dissolvedOxygen, float ph, float ammonia,
-                          float waterTemp, float airTemp, float humidity) {
+                          float freeAmmonia, float waterTemp, float airTemp,
+                          float humidity) {
   if (!isPaired() && !isProvisioned()) {
     Serial.println("Not paired - connect the device to the IsdaSafe website over USB to pair it. Skipping upload.");
     return false;
@@ -182,6 +185,7 @@ inline bool uploadReading(float dissolvedOxygen, float ph, float ammonia,
                 ",\"p_dissolved_oxygen\":" + jsonNumber(dissolvedOxygen) +
                 ",\"p_ph\":" + jsonNumber(ph) +
                 ",\"p_ammonia\":" + jsonNumber(ammonia) +
+                ",\"p_free_ammonia\":" + jsonNumber(freeAmmonia, 4) +
                 ",\"p_water_temperature\":" + jsonNumber(waterTemp, 1) +
                 ",\"p_air_temperature\":" + jsonNumber(airTemp, 1) +
                 ",\"p_humidity\":" + jsonNumber(humidity, 1) + "}";
