@@ -308,6 +308,42 @@ static size_t rs485ReadN(uint8_t* buf, size_t len, unsigned long timeoutMs) {
   return got;
 }
 
+// ---------------------------------------------------------------------------
+// Spike filter: NH3 and pH are reported as the MEDIAN of the last
+// WQ_MEDIAN_WINDOW good readings, so a single short spike (someone touching
+// the wiring/water) never shows up, while a real change comes through once
+// it holds for more than half the window (~3 readings, ~6 s at 2 s/reading).
+// Temperature is not filtered (it changes slowly and doesn't spike).
+// The history is cleared whenever the sensor's offset/calibration changes.
+// ---------------------------------------------------------------------------
+#define ENABLE_SPIKE_FILTER  1
+#define WQ_MEDIAN_WINDOW     5
+
+static float  wqNh3Hist[WQ_MEDIAN_WINDOW];
+static float  wqPhHist[WQ_MEDIAN_WINDOW];
+static size_t wqHistCount = 0, wqHistNext = 0;
+
+static void wqFilterReset() { wqHistCount = 0; wqHistNext = 0; }
+
+static void wqFilterPush(float nh3, float ph) {
+  wqNh3Hist[wqHistNext] = nh3;
+  wqPhHist[wqHistNext]  = ph;
+  wqHistNext = (wqHistNext + 1) % WQ_MEDIAN_WINDOW;
+  if (wqHistCount < WQ_MEDIAN_WINDOW) wqHistCount++;
+}
+
+static float wqMedian(const float* hist) {
+  float s[WQ_MEDIAN_WINDOW];
+  for (size_t i = 0; i < wqHistCount; i++) s[i] = hist[i];
+  for (size_t i = 1; i < wqHistCount; i++) {          // insertion sort, n <= 5
+    float v = s[i]; size_t j = i;
+    while (j > 0 && s[j - 1] > v) { s[j] = s[j - 1]; j--; }
+    s[j] = v;
+  }
+  return (wqHistCount % 2) ? s[wqHistCount / 2]
+                           : (s[wqHistCount / 2 - 1] + s[wqHistCount / 2]) / 2.0f;
+}
+
 bool readWaterQualitySensor() {
   uint8_t data[11] = {0};
   uint8_t ch = 0;
@@ -378,6 +414,17 @@ bool readWaterQualitySensor() {
     }
     return false;
   }
+
+#if ENABLE_SPIKE_FILTER
+  float rawNh3mg = readings.ammonia_mgL, rawPhVal = readings.ph;
+  wqFilterPush(rawNh3mg, rawPhVal);
+  readings.ammonia_mgL = wqMedian(wqNh3Hist);
+  readings.ph          = wqMedian(wqPhHist);
+  if (fabsf(rawNh3mg - readings.ammonia_mgL) >= 0.01f || fabsf(rawPhVal - readings.ph) >= 0.01f) {
+    Serial.printf("[DEBUG] spike filter: raw NH3=%.2f pH=%.2f -> median NH3=%.2f pH=%.2f (%u samples)\n",
+                  rawNh3mg, rawPhVal, readings.ammonia_mgL, readings.ph, (unsigned)wqHistCount);
+  }
+#endif
 
   // Datasheet ranges: NH3 0-100 mg/L, pH 0-14, temp 0-60 C.
   if (readings.ammonia_mgL > 100.0f || readings.ph > 14.0f ||
@@ -578,6 +625,7 @@ static bool wqWriteReg(uint16_t reg, uint16_t value) {
                      (uint8_t)(value >> 8), (uint8_t)value };
   appendCrc(req, 6);
   uint8_t r[8];
+  wqFilterReset();   // readings before the change no longer apply
   return wqTransact(req, sizeof(req), r, sizeof(r));
 }
 
@@ -588,6 +636,7 @@ static bool wqCalibrate(uint16_t baseReg, uint16_t point, float standard) {
                       (uint8_t)(point >> 8), (uint8_t)point, (uint8_t)(val >> 8), (uint8_t)val };
   appendCrc(req, 11);
   uint8_t r[8];
+  wqFilterReset();   // readings before the change no longer apply
   return wqTransact(req, sizeof(req), r, sizeof(r), 1000);
 }
 
