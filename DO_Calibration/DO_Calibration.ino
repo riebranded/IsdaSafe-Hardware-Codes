@@ -19,6 +19,12 @@
       DO_CAL2_V / DO_CAL2_T, then set DO_TWO_POINT_CALIBRATION to 1 in
       sketch1_aug1.ino.
 
+  Averaged capture (recommended): once the live voltage looks stable, type
+  "1" (calibration point 1) or "2" (point 2) in the Serial Monitor, line
+  ending Newline. The sketch then averages voltage and temperature over
+  60 s (or "1 120" for 120 s), reports mean / sd / min / max / drift, and
+  prints the ready-to-paste #define lines. Keep the probe still meanwhile.
+
   Wiring: same I2C bus as the main sketch -- ADS1115 SDA/SCL -> ESP32
   GPIO21/GPIO22, DO probe signal -> ADS1115 A0. DHT22 data -> GPIO15
   (same pin as the main sketch).
@@ -52,16 +58,115 @@ void setup() {
   dht.begin();
 }
 
+// ---------------------------------------------------------------------------
+// Averaged capture state ("1" / "2" commands)
+// ---------------------------------------------------------------------------
+#define CAPTURE_DEFAULT_S  60
+#define CAPTURE_MAX_DRIFT_MV 10.0f   // first-10s vs last-10s mean; above = not stable
+
+int      capPoint = 0;               // 0 = idle, 1 or 2 = capturing that point
+uint16_t capTotal = 0, capN = 0, capTempN = 0;
+double   capSumMv = 0, capSumSqMv = 0, capSumT = 0;
+float    capMinMv = 0, capMaxMv = 0;
+double   capFirstSum = 0, capLastSum = 0;
+uint16_t capFirstN = 0, capLastN = 0;
+String   cmdBuf;
+bool     halted = false;             // true after a result: readings paused so it stays visible
+
+void startCapture(int point, int seconds) {
+  halted = false;
+  capPoint = point;
+  capTotal = seconds;
+  capN = capTempN = 0;
+  capSumMv = capSumSqMv = capSumT = 0;
+  capFirstSum = capLastSum = 0;
+  capFirstN = capLastN = 0;
+  Serial.printf(">>> Capturing calibration point %d: averaging for %d s - keep the probe still...\n",
+                point, seconds);
+}
+
+void finishCapture() {
+  int point = capPoint;
+  capPoint = 0;
+  halted = true;   // stop printing so the result stays on screen (see end of this function)
+  if (capN < capTotal / 2) {
+    Serial.println(">>> Capture FAILED: too few readings (is the ADS1115 connected?)");
+    return;
+  }
+  float avgMv = capSumMv / capN;
+  float var = capSumSqMv / capN - (double)avgMv * avgMv;
+  float sd = var > 0 ? sqrtf(var) : 0;
+  float drift = (capLastN && capFirstN) ? (capLastSum / capLastN - capFirstSum / capFirstN) : 0;
+  Serial.println(">>> ===== CALIBRATION POINT RESULT =====");
+  Serial.printf(">>> samples=%u  mean=%.1f mV  sd=%.1f  min=%.1f  max=%.1f  drift=%+.1f mV\n",
+                capN, avgMv, sd, capMinMv, capMaxMv, drift);
+  if (fabsf(drift) > CAPTURE_MAX_DRIFT_MV) {
+    Serial.println(">>> WARNING: voltage still drifting - wait longer and capture again.");
+  }
+  if (capTempN == 0) {
+    Serial.println(">>> Temperature: DHT22 read failed - measure the temperature yourself.");
+    Serial.printf(">>> Paste into sketch1_aug1.ino:\n#define DO_CAL%d_V   %ld\n#define DO_CAL%d_T   <temp C>\n",
+                  point, lroundf(avgMv), point);
+  } else {
+    float avgT = capSumT / capTempN;
+    Serial.printf(">>> mean temperature (DHT22 = air) = %.1f C\n", avgT);
+    Serial.println(">>> (Saturated-water method: use the WATER temperature instead.)");
+    Serial.printf(">>> Paste into sketch1_aug1.ino:\n#define DO_CAL%d_V   %ld\n#define DO_CAL%d_T   %ld\n",
+                  point, lroundf(avgMv), point, lroundf(avgT));
+  }
+  Serial.println(">>> Readings PAUSED. Type r to resume live readings, or 1 / 2 for another capture.");
+  Serial.flush();
+}
+
+void pollCommands() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c != '\n' && c != '\r') { if (cmdBuf.length() < 32) cmdBuf += c; continue; }
+    cmdBuf.trim();
+    if (cmdBuf.equalsIgnoreCase("r")) {
+      halted = false;
+      Serial.println(">>> Resumed live readings.");
+    } else if (cmdBuf.length()) {
+      int point = cmdBuf.toInt();
+      int sp = cmdBuf.indexOf(' ');
+      int secs = sp > 0 ? cmdBuf.substring(sp + 1).toInt() : CAPTURE_DEFAULT_S;
+      if ((point == 1 || point == 2) && secs >= 10 && secs <= 600) {
+        startCapture(point, secs);
+      } else {
+        Serial.println(">>> Type 1 or 2 (optionally followed by seconds, e.g. \"1 120\").");
+      }
+    }
+    cmdBuf = "";
+  }
+}
+
 void loop() {
+  pollCommands();
+  if (halted) { delay(50); return; }   // result on screen: wait for r / 1 / 2
+
   int16_t raw = ads.readADC_SingleEnded(0);
   float voltage_mV = ads.computeVolts(raw) * 1000.0f;
   float tempC = dht.readTemperature();
 
   Serial.print("raw:\t" + String(raw) + "\tVoltage(mv):\t" + String(voltage_mV, 1));
   if (isnan(tempC)) {
-    Serial.println("\tTemp(C):\tread failed");
+    Serial.print("\tTemp(C):\tread failed");
   } else {
-    Serial.println("\tTemp(C):\t" + String(tempC, 1));
+    Serial.print("\tTemp(C):\t" + String(tempC, 1));
+  }
+
+  if (capPoint) {
+    if (capN == 0 || voltage_mV < capMinMv) capMinMv = voltage_mV;
+    if (capN == 0 || voltage_mV > capMaxMv) capMaxMv = voltage_mV;
+    capSumMv += voltage_mV; capSumSqMv += (double)voltage_mV * voltage_mV; capN++;
+    if (!isnan(tempC)) { capSumT += tempC; capTempN++; }
+    if (capN <= 10) { capFirstSum += voltage_mV; capFirstN++; }
+    if (capN > capTotal - 10) { capLastSum += voltage_mV; capLastN++; }
+    Serial.printf("\t[capturing P%d %u/%u]", capPoint, capN, capTotal);
+    Serial.println();
+    if (capN >= capTotal) finishCapture();
+  } else {
+    Serial.println();
   }
 
   delay(1000);
