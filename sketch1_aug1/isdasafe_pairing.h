@@ -89,6 +89,13 @@ static bool isHexToken(const String &s) {
 
 // Defined by the sketch: handles its own (non-pairing) serial commands.
 void handleAppSerialCommand(const String &line);
+// Defined in isdasafe_wifi.h: WIFI ... commands, and opening the WiFi setup
+// hotspot right after pairing so the owner can choose the network.
+bool wifiHandleSerialCommand(const String &line);
+// Defined in isdasafe_queue.h: QUEUE / QUEUE CLEAR.
+bool queueHandleSerialCommand(const String &line);
+void wifiOnPaired();
+void wifiStartSetup();
 
 static void handleSerialCommand(String line) {
   line.trim();
@@ -102,6 +109,7 @@ static void handleSerialCommand(String line) {
     isdaPrefs.putString("token", token);
     isdaToken = token;
     Serial.println("PAIRED OK");   // never echo the token itself
+    wifiOnPaired();
   } else if (line.startsWith("PROVISION ")) {
     String secret = line.substring(10);
     secret.trim();
@@ -117,6 +125,8 @@ static void handleSerialCommand(String line) {
     isdaPrefs.remove("token");
     isdaToken = "";
     Serial.println("UNPAIRED OK");
+  } else if (wifiHandleSerialCommand(line) || queueHandleSerialCommand(line)) {
+    // handled
   } else if (line.length() > 0) {
     handleAppSerialCommand(line);
   }
@@ -151,20 +161,27 @@ static String jsonNumber(float v, int decimals = 2) {
   return isnan(v) || isinf(v) ? String("null") : String(v, decimals);
 }
 
-// Uploads one reading to the account this device is paired to. Returns
-// true on success. Any value may be NAN (sent as null).
-// ammonia = total ammonia nitrogen (TAN, as measured); freeAmmonia = free
-// NH3 computed from TAN, pH and water temperature.
-inline bool uploadReading(float dissolvedOxygen, float ph, float ammonia,
-                          float freeAmmonia, float waterTemp, float airTemp,
-                          float humidity) {
+// JSON number at full float precision (no fixed rounding), e.g. 0.00312845
+// or 3.1e-05 -- for small computed values like free NH3.
+static String jsonNumberFull(float v) {
+  if (isnan(v) || isinf(v)) return String("null");
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%.7g", v);
+  return String(buf);
+}
+
+// Calls a Supabase upload RPC with this device's credential added as
+// p_token. `params` is the rest of the JSON object's members, starting with
+// a comma. Returns the HTTP status (200 = stored), or a negative value when
+// the request couldn't be made at all (no WiFi, timeout, ...).
+static int isdaPostRpc(const char *rpc, const String &params) {
   if (!isPaired() && !isProvisioned()) {
     Serial.println("Not paired - connect the device to the IsdaSafe website over USB to pair it. Skipping upload.");
-    return false;
+    return 0;
   }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi not connected - skipping upload.");
-    return false;
+    return -1;
   }
 
   WiFiClientSecure client;
@@ -173,26 +190,21 @@ inline bool uploadReading(float dissolvedOxygen, float ph, float ammonia,
   client.setInsecure();
   HTTPClient http;
   http.setTimeout(UPLOAD_TIMEOUT_MS);
-  if (!http.begin(client, String(SUPABASE_URL) + "/rest/v1/rpc/ingest_sensor_reading")) {
+  if (!http.begin(client, String(SUPABASE_URL) + "/rest/v1/rpc/" + rpc)) {
     Serial.println("HTTP begin() failed.");
-    return false;
+    return -1;
   }
   http.addHeader("Content-Type", "application/json");
   http.addHeader("apikey", SUPABASE_ANON_KEY);
   http.addHeader("Authorization", String("Bearer ") + SUPABASE_ANON_KEY);
 
-  String body = String("{\"p_token\":\"") + uploadCredential() + "\"" +
-                ",\"p_dissolved_oxygen\":" + jsonNumber(dissolvedOxygen) +
-                ",\"p_ph\":" + jsonNumber(ph) +
-                ",\"p_ammonia\":" + jsonNumber(ammonia) +
-                ",\"p_free_ammonia\":" + jsonNumber(freeAmmonia, 4) +
-                ",\"p_water_temperature\":" + jsonNumber(waterTemp, 1) +
-                ",\"p_air_temperature\":" + jsonNumber(airTemp, 1) +
-                ",\"p_humidity\":" + jsonNumber(humidity, 1) + "}";
-
-  int status = http.POST(body);
+  int status = http.POST(String("{\"p_token\":\"") + uploadCredential() + "\"" + params + "}");
+  bool setupRequested = false;
   if (status == 200) {
     Serial.println("Upload OK");
+    // The owner pressed "Change WiFi" on the website: the reply is
+    // "ok wifi_setup" instead of "ok".
+    setupRequested = http.getString().indexOf("wifi_setup") >= 0;
   } else if (status > 0) {
     // 401/403 here means the token was revoked (device removed in the app)
     // or the device was paired again elsewhere: pair it again over USB.
@@ -203,5 +215,28 @@ inline bool uploadReading(float dissolvedOxygen, float ph, float ammonia,
     Serial.printf("Upload failed: %s\n", http.errorToString(status).c_str());
   }
   http.end();
-  return status == 200;
+  if (setupRequested) {   // after the connection is closed
+    Serial.println("[WiFi] setup requested from the website.");
+    wifiStartSetup();
+  }
+  return status;
+}
+
+// Uploads one reading to the account this device is paired to, stamped with
+// the time it arrives. Returns true on success. Any value may be NAN (sent
+// as null). ammonia = total ammonia nitrogen (TAN, as measured);
+// freeAmmonia = free NH3 computed from TAN, pH and water temperature.
+// (The sketch uploads through isdasafe_queue.h instead, which keeps
+// readings while offline and sends the time each was taken.)
+inline bool uploadReading(float dissolvedOxygen, float ph, float ammonia,
+                          float freeAmmonia, float waterTemp, float airTemp,
+                          float humidity) {
+  return isdaPostRpc("ingest_sensor_reading",
+                     ",\"p_dissolved_oxygen\":" + jsonNumber(dissolvedOxygen) +
+                     ",\"p_ph\":" + jsonNumber(ph) +
+                     ",\"p_ammonia\":" + jsonNumber(ammonia) +
+                     ",\"p_free_ammonia\":" + jsonNumberFull(freeAmmonia) +
+                     ",\"p_water_temperature\":" + jsonNumber(waterTemp, 1) +
+                     ",\"p_air_temperature\":" + jsonNumber(airTemp, 1) +
+                     ",\"p_humidity\":" + jsonNumber(humidity, 1)) == 200;
 }

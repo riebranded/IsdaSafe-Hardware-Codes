@@ -30,12 +30,18 @@
    package, no separate install needed.)
 
   Networking:
-   - Connects to WiFi and uploads each reading to Supabase through
-     isdasafe_pairing.h (ingest_sensor_reading RPC + this device's pairing
-     token). The device must first be paired to an account from the
-     IsdaSafe website over USB (PAIR/UNPAIR serial commands).
-   - WIFI_SSID / WIFI_PASSWORD / SUPABASE_ANON_KEY live in secrets.h (not
-     in git). Copy secrets.example.h to secrets.h and fill it in.
+   - Connects to WiFi and uploads each reading to Supabase
+     (ingest_sensor_readings RPC + this device's token or factory secret,
+     see isdasafe_pairing.h). The device must first be paired to an account
+     (QR claim, or PAIR over USB).
+   - While offline, readings are kept in flash with the time they were
+     taken and uploaded once it's back online (isdasafe_queue.h).
+   - The WiFi network is chosen at run time and saved in flash
+     (isdasafe_wifi.h): from a phone via the "IsdaSafe-XXXX" setup hotspot
+     (opens when no saved network works, after pairing, or when BOOT is
+     held 3 s), or by the website over USB (WIFI ... serial commands).
+   - SUPABASE_ANON_KEY (and an optional default WIFI_SSID / WIFI_PASSWORD)
+     live in secrets.h (not in git). Copy secrets.example.h to secrets.h.
 
   Duty cycle:
    - Readings are taken once every 15 minutes. After a reading is captured,
@@ -53,8 +59,10 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <esp_sleep.h>
-#include "secrets.h"            // WIFI_SSID, WIFI_PASSWORD, SUPABASE_ANON_KEY (git-ignored)
+#include "secrets.h"            // SUPABASE_ANON_KEY, optional default WIFI_SSID/WIFI_PASSWORD (git-ignored)
 #include "isdasafe_pairing.h"   // deviceId(), PAIR/UNPAIR commands, uploadReading()
+#include "isdasafe_wifi.h"      // WiFi setup hotspot + WIFI ... commands
+#include "isdasafe_queue.h"     // submitReading(): keeps readings while offline
 
 // ---------------------------------------------------------------------------
 // I2C buses -- ADS1115 and LCD are on SEPARATE physical I2C buses (each on
@@ -126,7 +134,8 @@
 //   ESP32 GPIO18 -> IN1      ESP32 GPIO2 -> IN2
 //   Motor        -> OUT1 / OUT2
 //   VCC/VM       -> 5 V (or 3.3 V) supply,  GND -> ESP32 GND (must be shared)
-// The fan runs automatically only when water >= COOLING_ON_TEMP. To test it
+// With FAN_ALWAYS_ON=1 the fan runs constantly; with 0 it runs automatically
+// only when water >= COOLING_ON_TEMP. To test it
 // at any temperature type FAN ON / FAN 50 (percent) / FAN OFF / FAN AUTO in
 // the Serial Monitor. MOTOR_STBY_CONNECTED is only for boards that expose a
 // Sleep/STBY pin.
@@ -143,12 +152,12 @@
 #define COOLING_MAX_TEMP 34.0f  // water temp (C) at which the fan hits 100%
 #define COOLING_MIN_DUTY 120    // minimum duty that reliably spins the motor
 
-// TESTING: with RS485 disabled there's no real water temp, so the normal
-// temperature-based logic below can never turn the fan on. Set this to 1 to
-// force the fan to spin at a fixed test duty regardless of temperature, to
-// verify the motor/wiring works. Set back to 0 once RS485 is restored.
-#define FORCE_FAN_TEST      0
-#define FORCE_FAN_TEST_DUTY 180  // 0-255, must be >= COOLING_MIN_DUTY to actually spin
+// 1 = fan runs all the time at FAN_ALWAYS_ON_DUTY, from boot onward, ignoring
+// water temperature. 0 = run only when water >= COOLING_ON_TEMP.
+// (FAN OFF / FAN <percent> in the Serial Monitor still override it until
+// FAN AUTO.)
+#define FAN_ALWAYS_ON       1
+#define FAN_ALWAYS_ON_DUTY  255  // 0-255, must be >= COOLING_MIN_DUTY to actually spin
 
 // Spins the fan briefly at boot so you can confirm the motor and wiring work.
 #define FAN_BOOT_TEST_MS    2000
@@ -173,10 +182,33 @@ uint8_t fanDuty = 0;       // duty currently applied to IN1
 // ---------------------------------------------------------------------------
 #define DO_TWO_POINT_CALIBRATION 1
 
-#define DO_CAL1_V   647   // mV reading at calibration point 1
-#define DO_CAL1_T   30     // water temp (C) at calibration point 1
-#define DO_CAL2_V   365   // mV reading at calibration point 2 (two-point only)
-#define DO_CAL2_T   19     // water temp (C) at calibration point 2 (two-point only)
+#define DO_CAL1_V   555
+#define DO_CAL1_T   26
+#define DO_CAL2_V   365
+#define DO_CAL2_T   19
+
+// Catches a bad calibration before it's uploaded. In saturated water the
+// probe's voltage rises with temperature, by roughly 20-35 mV per degree C
+// (DFRobot uses 35), so the warmer point must read higher, and by 10-50 mV
+// per degree. A point taken in water that wasn't saturated, or before the
+// probe settled, fails this: redo that point with DO_Calibration.
+static_assert(DO_CAL1_V >= 100 && DO_CAL1_V <= 3000,
+              "DO_CAL1_V should be 100-3000 mV: redo calibration point 1");
+#if DO_TWO_POINT_CALIBRATION == 1
+static_assert(DO_CAL2_V >= 100 && DO_CAL2_V <= 3000,
+              "DO_CAL2_V should be 100-3000 mV: redo calibration point 2");
+static_assert(DO_CAL1_T - DO_CAL2_T >= 5 || DO_CAL2_T - DO_CAL1_T >= 5,
+              "DO calibration points need water temperatures at least 5 C apart");
+static_assert((DO_CAL1_V - DO_CAL2_V) * (DO_CAL1_T - DO_CAL2_T) > 0,
+              "DO calibration: the warmer point must have the higher mV - redo the point that looks off");
+// mV per degree = dV/dT; written as dV*dT vs k*dT^2 to stay in integers.
+static_assert((DO_CAL1_V - DO_CAL2_V) * (DO_CAL1_T - DO_CAL2_T) >=
+                  10 * (DO_CAL1_T - DO_CAL2_T) * (DO_CAL1_T - DO_CAL2_T),
+              "DO calibration: the mV change between the points is too small (under 10 mV/C) - redo the point that looks off");
+static_assert((DO_CAL1_V - DO_CAL2_V) * (DO_CAL1_T - DO_CAL2_T) <=
+                  50 * (DO_CAL1_T - DO_CAL2_T) * (DO_CAL1_T - DO_CAL2_T),
+              "DO calibration: the mV change between the points is too big (over 50 mV/C) - redo the point that looks off");
+#endif
 
 // Saturated DO (mg/L) in fresh water at 1 atm, index = temperature 0-40 C.
 // Same values as DFRobot's SEN0237 example (which stores them in ug/L) and
@@ -208,17 +240,10 @@ struct SensorReadings {
   float freeNh3_mgL         = NAN;   // un-ionized NH3, computed from NH3-N + pH + temp
 } readings;
 
-// Static pages. "First Page" (Water Temp, Air Temp, pH Level) is combined
-// -- abbreviated -- onto a single page since a 16x2 display can't fit 3
-// full labels+values statically. "2nd Page" group (Dissolved Oxygen,
-// Dissolved Ammonia, Humidity) keeps one full-label reading per page.
+// Which LCD page is showing (see updateLcd(); the pages depend on what's
+// connected and whether anything needs attention).
 uint8_t lcdPage = 0;
-#if ENABLE_RS485
-const uint8_t LCD_PAGE_COUNT = 4; // First Page (combined), DO, Ammonia, Humidity
-#else
-const uint8_t LCD_PAGE_COUNT = 3; // AirTemp, DO, Humidity
-#endif
-const unsigned long LCD_PAGE_DISPLAY_MS = 5000; // time to show each page before sleeping
+const unsigned long LCD_PAGE_DISPLAY_MS = 4000; // time to show each page
 
 // ---------------------------------------------------------------------------
 // Prints every pin/address assignment straight from the #defines above, so
@@ -273,6 +298,23 @@ void printPinConfig() {
 #define UPLOAD_INTERVAL_MS      60000UL
 
 #define READING_INTERVAL_MIN   1
+
+// DUTY CYCLE: 1 = power on -> sensors warm up for DUTY_WARMUP_MIN (readings
+// taken but NOT uploaded, LCD counts down) -> take THE reading and upload it
+// -> deep sleep DUTY_SLEEP_MIN -> wake and repeat. Every wake warms up
+// again, since the probes need time to stabilise. Overrides
+// ENABLE_DEEP_SLEEP and READING_INTERVAL_MIN above. 0 = as configured above.
+#define ENABLE_DUTY_CYCLE       0
+#define DUTY_WARMUP_MIN         5   // awake, sensors stabilising, before the reading
+#define DUTY_SLEEP_MIN          5   // deep sleep after the reading
+
+#if ENABLE_DUTY_CYCLE
+#undef  ENABLE_DEEP_SLEEP
+#define ENABLE_DEEP_SLEEP       0
+#undef  READING_INTERVAL_MIN
+#define READING_INTERVAL_MIN    DUTY_SLEEP_MIN
+#endif
+
 #define uS_TO_S_FACTOR          1000000ULL
 #define SLEEP_DURATION_US       ((uint64_t)READING_INTERVAL_MIN * 60 * uS_TO_S_FACTOR)
 
@@ -898,38 +940,147 @@ void handleAppSerialCommand(const String &line) {
 // ---------------------------------------------------------------------------
 // Dissolved Oxygen (ADS1115 + temperature-compensated lookup table)
 // ---------------------------------------------------------------------------
-bool adsOk = false;   // set in setup() from ads.begin()
+bool adsOk = false;   // set in setup() from ads.begin(); retried while false
 
-// Below this the DO probe is treated as disconnected. With the 200k pull-down
-// on A0 an unplugged input sits at ~0-20 mV of noise; a working probe in
-// water gives ~1000-1500 mV (DO_CAL1_V), and 50 mV is only ~0.3 mg/L, so
-// real readings above that are never blanked.
+// Below this the DO probe is treated as disconnected. With the pull-down on
+// A0 an unplugged input sits at ~0-20 mV of noise; a working probe gives
+// hundreds of mV (see DO_CAL1_V / DO_CAL2_V), and 50 mV is well under
+// 1 mg/L, so real readings above that are never blanked.
 #define DO_MIN_VALID_MV  50.0f
 
+// Above this fraction of saturation a DO value is treated as impossible.
+#define DO_MAX_SATURATION  2.0f
+
+// Each DO reading is the average of the middle DO_SAMPLES_KEPT of
+// DO_SAMPLES conversions: dropping the highest and lowest means one bad I2C
+// read can't skew it (the library doesn't report a failed read, it returns
+// ~0-48 mV), and averaging the rest smooths the probe's noise.
+#define DO_SAMPLES             15
+#define DO_SAMPLES_KEPT        9
+#define DO_SAMPLE_GAP_MS       10
+#define DO_CONVERSION_TIMEOUT_MS 50   // one conversion takes ~8 ms at 128 SPS
+
+// ADS1115 range: +/-4.096 V (0.125 mV per count). The probe board outputs
+// 0-3 V, so this covers it without clipping and is finer than the library's
+// default +/-6.144 V. computeVolts() follows the gain, so the DO_CAL mV
+// values stay valid whatever gain DO_Calibration used.
+#define DO_ADS_GAIN            GAIN_ONE
+
+// DO depends strongly on temperature (~2% per degree C), so it's only
+// computed with a real water temperature. If the SEN0711's temperature is
+// missing for a reading, the last one is used for up to this long (pond
+// water changes temperature slowly); after that there's no DO reading.
+#define DO_WATER_TEMP_MAX_AGE_MS (5UL * 60UL * 1000UL)
+
+// Whether the ADS1115 acknowledges its address on Wire1.
+static bool adsAnswers() {
+  Wire1.beginTransmission(ADS1115_ADDR);
+  return Wire1.endTransmission() == 0;
+}
+
+// One conversion on A0 in mV, or NAN if the ADS1115 didn't answer before
+// and after it or didn't finish in time. Used instead of
+// ads.readADC_SingleEnded(), which waits forever if the chip stops answering.
+static float adsReadA0mV() {
+  if (!adsAnswers()) return NAN;
+  ads.startADCReading(MUX_BY_CHANNEL[0], /*continuous=*/false);
+  unsigned long start = millis();
+  while (!ads.conversionComplete()) {
+    if (millis() - start > DO_CONVERSION_TIMEOUT_MS) return NAN;
+    delay(1);
+  }
+  int16_t counts = ads.getLastConversionResults();
+  if (!adsAnswers()) return NAN;
+  return ads.computeVolts(counts) * 1000.0f;
+}
+
+// Starts the ADS1115 on Wire1 at DO_ADS_GAIN; false if it doesn't answer.
+bool adsBegin() {
+  ads.setGain(DO_ADS_GAIN);
+  return ads.begin(ADS1115_ADDR, &Wire1);
+}
+
+// Saturated DO (mg/L) at waterTempC, interpolated between the whole degrees
+// of DO_TABLE (0-40 C).
+static float doSaturation(float waterTempC) {
+  float t = constrain(waterTempC, 0.0f, 40.0f);
+  int i = (int)t;
+  if (i >= 40) return DO_TABLE[40];
+  return DO_TABLE[i] + (DO_TABLE[i + 1] - DO_TABLE[i]) * (t - i);
+}
+
 float readDissolvedOxygen(float waterTempC) {
-  if (!adsOk) {
-    Serial.println("[DEBUG] DO: ADS1115 not detected at boot - no DO reading.");
+  if (isnan(waterTempC)) {
+    Serial.println("[DEBUG] DO: no water temperature from the SEN0711 - no DO reading (it can't be temperature-compensated).");
     return NAN;
   }
-  int16_t adcCounts = ads.readADC_SingleEnded(0);
-  float voltage_mV = ads.computeVolts(adcCounts) * 1000.0f;
-  Serial.printf("[DEBUG] DO probe voltage: %.1f mV\n", voltage_mV);
+  if (!adsOk) {
+    // Not found at boot (or stopped answering): try again every reading.
+    adsOk = adsBegin();
+    if (!adsOk) {
+      Serial.println("[DEBUG] DO: ADS1115 not answering on I2C - no DO reading (check SDA/SCL/power).");
+      return NAN;
+    }
+    Serial.println("[DEBUG] DO: ADS1115 found again.");
+  }
+
+  float samples[DO_SAMPLES];
+  int n = 0;
+  for (int i = 0; i < DO_SAMPLES; i++) {
+    float mV = adsReadA0mV();
+    if (!isnan(mV)) {   // insertion sort as they come in
+      int j = n++;
+      while (j > 0 && samples[j - 1] > mV) { samples[j] = samples[j - 1]; j--; }
+      samples[j] = mV;
+    }
+    if (i < DO_SAMPLES - 1) delay(DO_SAMPLE_GAP_MS);
+  }
+  if (n == 0) {
+    Serial.println("[DEBUG] DO: ADS1115 stopped answering on I2C - no DO reading; will re-init next time.");
+    adsOk = false;
+    return NAN;
+  }
+  // Average of the middle DO_SAMPLES_KEPT (or as many as there are).
+  int keep = n < DO_SAMPLES_KEPT ? n : DO_SAMPLES_KEPT;
+  int first = (n - keep) / 2;
+  float sum = 0;
+  for (int i = first; i < first + keep; i++) sum += samples[i];
+  float voltage_mV = sum / keep;
+  Serial.printf("[DEBUG] DO probe voltage: %.1f mV (mean of middle %d of %d/%d, range %.1f-%.1f)\n",
+                voltage_mV, keep, n, DO_SAMPLES, samples[0], samples[n - 1]);
   if (voltage_mV < DO_MIN_VALID_MV) {
     Serial.printf("[DEBUG] DO: %.1f mV < %.0f mV -> probe disconnected (or no oxygen).\n",
                   voltage_mV, DO_MIN_VALID_MV);
     return NAN;
   }
 
-  int tempIndex = (int)constrain(waterTempC, 0, 40);
-
+  // Probe voltage in saturated water at this temperature (from the
+  // calibration) and the DO that saturation means. Both use the exact
+  // temperature, not whole degrees: 1 C off is ~2% off.
+  float t = constrain(waterTempC, 0.0f, 40.0f);
 #if DO_TWO_POINT_CALIBRATION == 1
-  float vSaturation = (float)(tempIndex - DO_CAL2_T) * (DO_CAL1_V - DO_CAL2_V)
-                       / (DO_CAL1_T - DO_CAL2_T) + DO_CAL2_V;
+  float vSaturation = (t - DO_CAL2_T) * (DO_CAL1_V - DO_CAL2_V)
+                       / (float)(DO_CAL1_T - DO_CAL2_T) + DO_CAL2_V;
 #else
-  float vSaturation = DO_CAL1_V + 35.0f * (tempIndex - DO_CAL1_T);
+  float vSaturation = DO_CAL1_V + 35.0f * (t - DO_CAL1_T);
 #endif
+  float saturation = doSaturation(t);
 
-  float doValue = (voltage_mV * DO_TABLE[tempIndex]) / vSaturation;
+  float doValue = voltage_mV * saturation / vSaturation;
+
+  // Water can't hold more than about twice its saturation level (algae on a
+  // sunny afternoon can push a pond to ~150-200%). Anything above that is a
+  // bad calibration or a bubble on the membrane, not a reading: send it as
+  // missing rather than a value that looks healthy.
+  float maxPlausible = saturation * DO_MAX_SATURATION;
+  if (doValue > maxPlausible) {
+    Serial.printf("[DEBUG] DO: %.2f mg/L is over %.0f%% saturation (%.2f mg/L at %.1f C) -> not plausible, "
+                  "no DO reading. Check the calibration (DO_CAL...) and for bubbles on the membrane.\n",
+                  doValue, DO_MAX_SATURATION * 100.0f, maxPlausible, t);
+    return NAN;
+  }
+  Serial.printf("[DEBUG] DO: %.2f mg/L = %.0f%% saturation at %.1f C (saturated: %.2f mg/L at %.0f mV)\n",
+                doValue, doValue / saturation * 100.0f, t, saturation, vSaturation);
   return doValue;
 }
 
@@ -1080,8 +1231,20 @@ void pollSensors() {
   Serial.println("RS485 disabled (ENABLE_RS485=0) - skipping pH/Ammonia/WaterTemp.");
 #endif
 
-  float waterTempForCal = isnan(readings.waterTemp_C) ? 25.0f : readings.waterTemp_C;
-  readings.dissolvedOxygen_mgL = readDissolvedOxygen(waterTempForCal);
+  // DO is compensated with the real water temperature (or the last one, if
+  // this read missed it and it's recent), never a guessed value.
+  static float lastWaterTemp = NAN;
+  static unsigned long lastWaterTempMs = 0;
+  float waterTempForDo = readings.waterTemp_C;
+  if (!isnan(waterTempForDo)) {
+    lastWaterTemp = waterTempForDo;
+    lastWaterTempMs = millis();
+  } else if (!isnan(lastWaterTemp) && millis() - lastWaterTempMs <= DO_WATER_TEMP_MAX_AGE_MS) {
+    waterTempForDo = lastWaterTemp;
+    Serial.printf("[DEBUG] DO: using the last water temperature (%.1f C, %lu s old).\n",
+                  lastWaterTemp, (millis() - lastWaterTempMs) / 1000UL);
+  }
+  readings.dissolvedOxygen_mgL = readDissolvedOxygen(waterTempForDo);
 
   pollDht(true);
 }
@@ -1112,8 +1275,8 @@ void controlCooling(float waterTempC) {
     return;
   }
 
-#if FORCE_FAN_TEST
-  duty = FORCE_FAN_TEST_DUTY; // ignore temperature entirely -- test mode
+#if FAN_ALWAYS_ON
+  duty = FAN_ALWAYS_ON_DUTY;  // ignore temperature entirely
 #else
   if (!isnan(waterTempC) && waterTempC >= COOLING_ON_TEMP) {
     float span = COOLING_MAX_TEMP - COOLING_ON_TEMP;
@@ -1141,8 +1304,12 @@ void handleFanCommand(String cmd) {
     fanOverride = pct * 255 / 100;
   }
   if (fanOverride < 0) {
+#if FAN_ALWAYS_ON
+    Serial.println("[FAN] AUTO: FAN_ALWAYS_ON=1, fan stays on");
+#else
     Serial.printf("[FAN] AUTO: runs when water >= %.0f C (now %.1f C)\n",
                   COOLING_ON_TEMP, readings.waterTemp_C);
+#endif
     controlCooling(readings.waterTemp_C);
   } else {
     Serial.println("[FAN] manual override (type FAN AUTO to return to temperature control)");
@@ -1150,61 +1317,9 @@ void handleFanCommand(String cmd) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// LCD -- one reading per page (full label on line 0, value on line 1).
-// "First Page" group: Water Temp, Air Temp, pH Level.
-// "2nd Page" group: Dissolved Oxygen, Dissolved Ammonia, Humidity.
-// ---------------------------------------------------------------------------
-void printLine(uint8_t row, const String &text) {
-  String padded = text;
-  while (padded.length() < LCD_COLS) padded += ' ';
-  lcd.setCursor(0, row);
-  lcd.print(padded.substring(0, LCD_COLS)); // hard cap -- never exceeds 16 chars
-}
-
-void updateLcd() {
-#if ENABLE_RS485
-  switch (lcdPage) {
-    // --- First Page group: Water Temp, Air Temp, pH Level combined ---
-    case 0:
-      printLine(0, "WT:" + String(readings.waterTemp_C, 1) + "C AT:" + String(readings.ambientTemp_C, 1) + "C");
-      printLine(1, "pH:" + String(readings.ph, 2));
-      break;
-    // --- 2nd Page group: one full-label reading per page ---
-    case 1:
-      printLine(0, "Dissolved");
-      printLine(1, "Oxygen:" + String(readings.dissolvedOxygen_mgL, 2) + "mg/L");
-      break;
-    case 2:
-      // Line 0: toxic free NH3 (+ "!" while the alarm is on); line 1: total.
-      printLine(0, "Free NH3:" + String(readings.freeNh3_mgL, 3) + (freeNh3Alarm ? " !" : ""));
-      printLine(1, "Ammonia:" + String(readings.ammonia_mgL, 2) + "mg/L");
-      break;
-    case 3:
-      printLine(0, "Humidity:");
-      printLine(1, String(readings.humidity_pct, 0) + "%");
-      break;
-  }
-#else
-  // RS485 disabled: Water Temp/pH Level/Ammonia all come from that one
-  // sensor, so only Air Temp, Dissolved Oxygen, and Humidity are shown
-  // (Air Temp alone, so no need to combine/abbreviate it).
-  switch (lcdPage) {
-    case 0:
-      printLine(0, "Air Temp:");
-      printLine(1, String(readings.ambientTemp_C, 1) + "C");
-      break;
-    case 1:
-      printLine(0, "Dissolved");
-      printLine(1, "Oxygen:" + String(readings.dissolvedOxygen_mgL, 2) + "mg/L");
-      break;
-    case 2:
-      printLine(0, "Humidity:");
-      printLine(1, String(readings.humidity_pct, 0) + "%");
-      break;
-  }
-#endif
-}
+// LCD screens: one reading per page with its status, an alert page, a
+// WiFi/sync status page and the boot screen -- see isdasafe_lcd.h.
+#include "isdasafe_lcd.h"
 
 // delay() replacement used for every wait: keeps listening for the website's
 // PAIR/UNPAIR commands over USB serial (and, if enabled, keeps the DHT22 and
@@ -1213,12 +1328,63 @@ void delayPollingDht(unsigned long ms) {
   unsigned long start = millis();
   while (millis() - start < ms) {
     pollSerialCommands();
+    wifiLoop();
 #if ENABLE_DHT_CONTINUOUS
     if (pollDht()) updateLcd();
 #endif
     delay(20);
   }
 }
+
+#if ENABLE_DUTY_CYCLE
+// ---------------------------------------------------------------------------
+// Duty cycle warm-up: stay awake until DUTY_WARMUP_MIN after power-on (or
+// wake) so the probes stabilise before the one reading that counts. The
+// sensors are still read every DUTY_WARMUP_POLL_MS -- that keeps the SEN0711
+// median filter full of settled values and shows live values on the LCD --
+// but nothing is uploaded. WiFi, the setup hotspot and serial (WQ ...)
+// commands keep working meanwhile.
+// ---------------------------------------------------------------------------
+#define DUTY_WARMUP_POLL_MS 10000UL
+
+void dutyWarmUp() {
+  // Counted from power-on: WiFi connecting at boot is part of the wait.
+  lcdWarmupUntilMs = (unsigned long)DUTY_WARMUP_MIN * 60000UL;
+  if (millis() >= lcdWarmupUntilMs) {
+    lcdWarmupUntilMs = 0;
+    return;
+  }
+  Serial.printf("[DUTY] warming up the sensors for %d min before the reading (nothing uploaded yet)...\n",
+                DUTY_WARMUP_MIN);
+  unsigned long lastPoll = 0, lastPage = millis(), lastLog = millis();
+  updateLcd();
+  while (millis() < lcdWarmupUntilMs) {
+#if ENABLE_RS485
+    runPendingWqCommand();   // WQ ... commands typed in the Serial Monitor
+#endif
+    if (lastPoll == 0 || millis() - lastPoll >= DUTY_WARMUP_POLL_MS) {
+      lastPoll = millis();
+      pollSensors();
+      controlCooling(readings.waterTemp_C);
+    }
+    if (millis() - lastPage >= LCD_PAGE_DISPLAY_MS) {
+      lastPage = millis();
+      // Countdown, reading page, countdown, next reading page, ...
+      lcdShowCountdown = !lcdShowCountdown;
+      if (!lcdShowCountdown) lcdPage = (lcdPage + 1) % lcdPageCount();
+      updateLcd();
+    }
+    if (millis() - lastLog >= 60000UL) {
+      lastLog = millis();
+      unsigned long left = (lcdWarmupUntilMs - millis()) / 1000UL;
+      Serial.printf("[DUTY] warm-up: %lu:%02lu left\n", left / 60, left % 60);
+    }
+    delayPollingDht(50);
+  }
+  lcdWarmupUntilMs = 0;
+  Serial.println("[DUTY] warm-up done - taking the reading.");
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Power down peripherals and drop into deep sleep until the next reading.
@@ -1252,37 +1418,53 @@ void goToSleep() {
 void setup() {
   Serial.begin(115200);
   pairingBegin();   // prints ID=<chip id>  PAIRED=yes|no
+  queueBegin();     // readings saved while offline, still to upload
   printPinConfig();
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting to WiFi");
-  unsigned long wifiStart = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 20000) {
-    delayPollingDht(500);
-    Serial.print(".");
-  }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("WiFi connected, IP: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("WiFi connect timed out - will keep retrying in background.");
-  }
-
-  // LCD bus (global Wire) -- must begin() before lcd.init(), since the LCD
-  // library also calls Wire.begin() internally with no args; whichever
-  // begin() call runs first wins the pin assignment, later calls just warn
-  // "already started" and keep the existing pins.
+  // LCD first, so the boot shows progress. Its bus (global Wire) must
+  // begin() before lcd.init(), since the LCD library also calls
+  // Wire.begin() internally with no args; whichever begin() call runs first
+  // wins the pin assignment, later calls just warn "already started" and
+  // keep the existing pins.
   Wire.begin(LCD_SDA_PIN, LCD_SCL_PIN);
   lcd.init();
   lcd.backlight();
-  printLine(0, "IsdaSafe boot...");
-  printLine(1, "");
+  lcdCreateChars();
+  lcdBootStep("Starting...");
+
+  // The network comes from flash (see isdasafe_wifi.h). With none saved, or
+  // if the saved one can't be reached, the setup hotspot opens so it can be
+  // chosen from a phone.
+  if (wifiBegin()) {
+    Serial.print("Connecting to WiFi \"" + wifiSavedSsid() + "\"");
+    lcdBootStep("Connecting WiFi");
+    unsigned long wifiStart = millis();
+    // Stops early once the router has clearly said no (not in range, wrong
+    // password), so the hotspot opens in seconds rather than after 20 s.
+    while (WiFi.status() != WL_CONNECTED && !wifiSavedFailed() && millis() - wifiStart < 20000) {
+      delayPollingDht(500);
+      Serial.print(".");
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("WiFi connected, IP: ");
+      Serial.println(WiFi.localIP());
+      lcdBootStep(String((char)LCD_WIFI) + WiFi.SSID());
+    } else {
+      Serial.println(wifiSavedFailed()
+                       ? "Saved WiFi not reachable - opening the setup hotspot (still retrying in background)."
+                       : "WiFi connect timed out - opening the setup hotspot (still retrying in background).");
+      wifiStartSetup();
+    }
+  } else {
+    Serial.println("No WiFi network saved - opening the setup hotspot.");
+    wifiStartSetup();
+  }
+
 
   // ADS1115 bus (separate, Wire1) -- kept independent from the LCD's bus.
   Wire1.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  adsOk = ads.begin(ADS1115_ADDR, &Wire1);
+  adsOk = adsBegin();
   if (!adsOk) {
     Serial.println("ADS1115 not found - check DO sensor wiring/address.");
   }
@@ -1310,7 +1492,10 @@ void setup() {
   ledcAttach(MOTOR_AIN1_PIN, PWM_FREQ_HZ, PWM_RESOLUTION);
   ledcAttach(MOTOR_AIN2_PIN, PWM_FREQ_HZ, PWM_RESOLUTION);
   ledcWrite(MOTOR_AIN2_PIN, 0);
-#if FAN_BOOT_TEST_MS > 0
+#if FAN_ALWAYS_ON
+  Serial.println("[FAN] FAN_ALWAYS_ON=1: fan on from boot.");
+  setFanDuty(FAN_ALWAYS_ON_DUTY);
+#elif FAN_BOOT_TEST_MS > 0
   Serial.println("[FAN] boot test: motor should spin now...");
   setFanDuty(255);
   delayPollingDht(FAN_BOOT_TEST_MS);
@@ -1318,9 +1503,15 @@ void setup() {
   Serial.println("[FAN] boot test done. Didn't spin? Check VCC/VM power, shared GND, OUT1/OUT2.");
 #endif
 
+#if ENABLE_DUTY_CYCLE
+  dutyWarmUp();   // DUTY_WARMUP_MIN from power-on before the reading that counts
+#endif
+
   runReadingCycle();
 
 #if ENABLE_DEEP_SLEEP
+  // Don't sleep while someone may be choosing a network on the setup page.
+  while (wifiSetupActive()) delayPollingDht(50);
   goToSleep();
 #else
   Serial.println("ENABLE_DEEP_SLEEP=0 (testing mode) - looping instead of sleeping.");
@@ -1363,8 +1554,9 @@ void runReadingCycle() {
     static unsigned long lastUploadMs = 0;
     if (!uploadedOnce || millis() - lastUploadMs >= UPLOAD_INTERVAL_MS) {
 #endif
-      if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
-      uploadReading(readings.dissolvedOxygen_mgL, readings.ph, readings.ammonia_mgL,
+      if (WiFi.status() != WL_CONNECTED && !wifiTrying()) WiFi.reconnect();
+      // Uploads it (plus anything saved while offline), or saves it for later.
+      submitReading(readings.dissolvedOxygen_mgL, readings.ph, readings.ammonia_mgL,
                     readings.freeNh3_mgL, readings.waterTemp_C, readings.ambientTemp_C, readings.humidity_pct);
 #if !ENABLE_DEEP_SLEEP
       uploadedOnce = true;
@@ -1379,7 +1571,7 @@ void runReadingCycle() {
 #if ENABLE_DEEP_SLEEP
   // Briefly rotate through the LCD pages (3 readings each) so the reading
   // is visible on-device before powering down.
-  for (lcdPage = 0; lcdPage < LCD_PAGE_COUNT; lcdPage++) {
+  for (lcdPage = 0; lcdPage < lcdPageCount(); lcdPage++) {
     updateLcd();
     delayPollingDht(LCD_PAGE_DISPLAY_MS);
   }
@@ -1404,7 +1596,7 @@ void loop() {
   static unsigned long lastPageMs = millis();
   if (millis() - lastPageMs >= LCD_PAGE_DISPLAY_MS) {
     lastPageMs = millis();
-    lcdPage = (lcdPage + 1) % LCD_PAGE_COUNT;
+    lcdPage = (lcdPage + 1) % lcdPageCount();
     updateLcd();
   }
   if (millis() - lastCycleStartMs >= TEST_LOOP_INTERVAL_MS) {

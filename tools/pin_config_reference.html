@@ -1,0 +1,123 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<title>IsdaSafe Wiring &amp; Configuration Reference</title>
+<style>
+  @page { size: A4; margin: 16mm 15mm; }
+  body { font-family: "Segoe UI", "Noto Sans", Arial, sans-serif; color: #1d2b36; font-size: 10.5pt; line-height: 1.38; margin: 0; }
+  h1 { color: #0d3a52; font-size: 23pt; margin: 0 0 2px; }
+  .sub { color: #555; font-size: 10pt; margin-bottom: 12px; }
+  h2 { color: #0d3a52; font-size: 13.5pt; margin: 18px 0 6px; padding-bottom: 3px; border-bottom: 2.5px solid #0d3a52; break-after: avoid; }
+  table { width: 100%; border-collapse: collapse; margin: 4px 0 8px; break-inside: avoid; }
+  th { background: #0d3a52; color: #fff; text-align: left; padding: 6px 8px; font-size: 10pt; }
+  td { border: 1px solid #c8d2dc; padding: 5px 8px; vertical-align: top; }
+  tr:nth-child(even) td { background: #f1f5f9; }
+  td.pin { font-weight: 700; color: #0d3a52; white-space: nowrap; }
+  code { font-family: Consolas, "Cascadia Mono", monospace; font-size: 9pt; background: #eef1f4; padding: 1px 4px; border-radius: 3px; }
+  .note { background: #fdf6e3; border-left: 4px solid #f0b400; padding: 8px 12px; margin: 8px 0; break-inside: avoid; }
+  .chg { background: #e8f4ec; border-left: 4px solid #2e8b57; padding: 8px 12px; margin: 8px 0; break-inside: avoid; }
+  ul { margin: 4px 0 0 0; padding-left: 18px; }
+</style></head>
+<body>
+<h1>IsdaSafe — IoT Pond Monitoring System</h1>
+<div class="sub">ESP32 Pin Assignments &amp; Configuration Reference (rev. 3) &nbsp;|&nbsp; Source: <code>sketch1_aug1/sketch1_aug1.ino</code> &nbsp;|&nbsp; October 15, 2026</div>
+
+<h2>1. ESP32 Pin Assignments</h2>
+<table>
+<tr><th style="width:15%">ESP32 GPIO</th><th style="width:40%">Connects To</th><th>Purpose</th></tr>
+<tr><td class="pin">GPIO 21</td><td>ADS1115 SDA</td><td>I2C data, ADS1115 bus (<code>Wire1</code>)</td></tr>
+<tr><td class="pin">GPIO 22</td><td>ADS1115 SCL</td><td>I2C clock, ADS1115 bus (<code>Wire1</code>)</td></tr>
+<tr><td class="pin">GPIO 25</td><td>LCD backpack SDA</td><td>I2C data, LCD bus (<code>Wire</code>)</td></tr>
+<tr><td class="pin">GPIO 27</td><td>LCD backpack SCL</td><td>I2C clock, LCD bus (<code>Wire</code>)</td></tr>
+<tr><td class="pin">GPIO 15</td><td>DHT22 data</td><td>Air temperature &amp; humidity</td></tr>
+<tr><td class="pin">GPIO 16</td><td>MAX3485 RO (receiver out)</td><td>UART1 RX from the SEN0711 water-quality sensor (Modbus)</td></tr>
+<tr><td class="pin">GPIO 17</td><td>MAX3485 DI (driver in)</td><td>UART1 TX to the SEN0711 water-quality sensor (Modbus)</td></tr>
+<tr><td class="pin">GPIO 32</td><td>MAX3485 DE + RE (bridged together)</td><td>RS485 direction: HIGH = transmit, LOW = receive</td></tr>
+<tr><td class="pin">GPIO 18</td><td>DRV8833 IN1</td><td>Cooling fan PWM (speed)</td></tr>
+<tr><td class="pin">GPIO 2</td><td>DRV8833 IN2</td><td>Held LOW (fan runs forward only)</td></tr>
+<tr><td class="pin">GPIO 0</td><td>On-board BOOT button</td><td>Hold 3 s to open the Wi-Fi setup hotspot</td></tr>
+</table>
+<div class="note"><b>Notes:</b>
+<ul>
+<li>The ADS1115 and the LCD are on <b>two separate I2C buses</b>; do not join their SDA/SCL wires.</li>
+<li>The DFRobot Gravity Dissolved Oxygen sensor does <b>not</b> connect directly to the ESP32. Its analog output goes to ADS1115 channel <b>A0</b>; the ADS1115 talks to the ESP32 over GPIO 21/22.</li>
+<li>GPIO 16/17 are taken by the MAX3485 wires even when RS485 is disabled in firmware.</li>
+<li>GPIO 4 (DRV8833 Sleep/STBY) is <b>not used</b>: the driver board's sleep pin is tied on internally (<code>MOTOR_STBY_CONNECTED = 0</code>).</li>
+<li>All modules share GND with the ESP32, including the SEN0711's separate 10–30 V supply.</li>
+</ul></div>
+<div class="chg"><b>Changes since rev. 2:</b> ADS1115 and LCD split onto separate buses (ADS1115 SDA GPIO 18 → <b>21</b>; LCD on <b>GPIO 25/27</b>) • RS485 RX GPIO 4 → <b>16</b> • RS485 module replaced by a <b>MAX3485</b> with DE/RE on <b>GPIO 32</b> • Fan IN1 GPIO 25 → <b>18</b>, IN2 GPIO 13 → <b>2</b> • DRV8833 Sleep pin no longer wired (was GPIO 27) • ADS1115 address 0x48 → <b>0x49</b> • BOOT button added for Wi-Fi setup.</div>
+
+<h2>2. Components &amp; Power</h2>
+<table>
+<tr><th style="width:30%">Component</th><th style="width:28%">Power</th><th>Notes</th></tr>
+<tr><td>ESP32 dev board</td><td>USB 5 V / VIN</td><td>3V3 pin powers the 3.3 V modules below</td></tr>
+<tr><td>DFRobot Gravity Analog DO sensor (SEN0237-A)</td><td>3.3–5 V</td><td>Analog out → ADS1115 A0</td></tr>
+<tr><td>ADS1115 16-bit ADC module</td><td>3.3 V</td><td>A0 input must stay below its VDD</td></tr>
+<tr><td>DFRobot SEN0711 RS485 NH3 / pH / water-temp probe</td><td>10–30 V DC, own supply (0.3 W)</td><td>Brown = VCC, Black = GND, Yellow = 485-A, Blue = 485-B. The MAX3485 cannot power it.</td></tr>
+<tr><td>MAX3485 TTL ↔ RS485 module</td><td>3.3 V</td><td>A/B to the SEN0711's Yellow/Blue wires</td></tr>
+<tr><td>DHT22</td><td>3.3 V</td><td>Ambient (enclosure) temperature &amp; humidity</td></tr>
+<tr><td>16×2 LCD + PCF8574 I2C backpack</td><td>5 V via buck converter</td><td>On-device readout</td></tr>
+<tr><td>DRV8833 dual H-bridge</td><td>VM 5 V (or 3.3 V)</td><td>OUT1/OUT2 → 3 V / 1000 RPM DC fan motor</td></tr>
+</table>
+
+<h2>3. I2C Devices</h2>
+<table>
+<tr><th style="width:30%">Device</th><th style="width:12%">Bus</th><th style="width:12%">Address</th><th>Notes</th></tr>
+<tr><td>ADS1115 (DO sensor)</td><td>Wire1</td><td><code>0x49</code></td><td>ADDR pin → VDD (use <code>0x48</code> if ADDR → GND). DO signal on A0, gain ±4.096 V (0.125 mV/count).</td></tr>
+<tr><td>LCD 16×2 (I2C backpack)</td><td>Wire</td><td><code>0x27</code></td><td>Try <code>0x3F</code> if the display is blank</td></tr>
+</table>
+
+<h2>4. RS485 Water-Quality Sensor (SEN0711: NH3 / pH / Water Temp)</h2>
+<table>
+<tr><th style="width:28%">Setting</th><th style="width:22%">Value</th><th>Notes</th></tr>
+<tr><td>Serial</td><td><code>4800</code>, 8N1</td><td>Fixed per sensor datasheet, ESP32 UART1</td></tr>
+<tr><td>Modbus slave ID</td><td><code>1</code></td><td>Function code 0x03</td></tr>
+<tr><td>Register start / count</td><td><code>0x0000</code> / 3</td><td>NH3, pH, temperature read in one transaction</td></tr>
+<tr><td>Ammonia scale</td><td>raw ÷ 100</td><td>→ mg/L (NH3-N); free NH3 computed from NH3 + pH + temp</td></tr>
+<tr><td>pH scale</td><td>raw ÷ 100</td><td>→ pH</td></tr>
+<tr><td>Water temp scale</td><td>raw ÷ 10</td><td>→ °C (also used for DO temperature compensation)</td></tr>
+<tr><td>Direction control</td><td>GPIO 32</td><td>MAX3485 DE+RE driven by the ESP32 (<code>RS485_USE_DE_RE = 1</code>)</td></tr>
+</table>
+
+<h2>5. Dissolved Oxygen</h2>
+<table>
+<tr><th style="width:28%">Setting</th><th style="width:30%">Value</th><th>Notes</th></tr>
+<tr><td>Calibration mode</td><td>Two-point</td><td><code>DO_TWO_POINT_CALIBRATION = 1</code></td></tr>
+<tr><td>Point 1</td><td>555 mV @ 26 °C</td><td>Saturated water / air, from the <code>DO_Calibration</code> sketch</td></tr>
+<tr><td>Point 2</td><td>365 mV @ 19 °C</td><td>Must be ≥ 5 °C from point 1, 10–50 mV/°C (checked at compile time)</td></tr>
+<tr><td>Sampling</td><td>15 conversions</td><td>Highest/lowest dropped, middle 9 averaged</td></tr>
+<tr><td>Temperature compensation</td><td>SEN0711 water temp</td><td>Exact (interpolated) temperature, not whole degrees. If the water temp is missing for more than 5 min, no DO reading is reported.</td></tr>
+<tr><td>Rejected readings</td><td>&lt; 50 mV, &gt; 200% sat.</td><td>Probe disconnected, or bad calibration / bubble on the membrane</td></tr>
+</table>
+
+<h2>6. Cooling Fan (DRV8833)</h2>
+<table>
+<tr><th style="width:28%">Setting</th><th style="width:22%">Value</th><th>Notes</th></tr>
+<tr><td>PWM</td><td><code>5000 Hz</code>, 8-bit</td><td>Duty 0–255 on IN1</td></tr>
+<tr><td>Mode</td><td>Always on, duty 255</td><td><code>FAN_ALWAYS_ON = 1</code>; set 0 for temperature control</td></tr>
+<tr><td>Temperature control</td><td>30.0 → 34.0 °C</td><td>Fan starts at 30 °C, 100% at 34 °C (when not always-on)</td></tr>
+<tr><td>Minimum duty</td><td>120</td><td>Lowest duty that reliably spins the motor</td></tr>
+<tr><td>Kick-start / boot test</td><td>150 ms / 2 s</td><td>Full power briefly when starting; spins 2 s at boot</td></tr>
+<tr><td>Serial commands</td><td colspan="2"><code>FAN ON</code> · <code>FAN OFF</code> · <code>FAN AUTO</code> · <code>FAN &lt;0–100&gt;</code> (percent)</td></tr>
+</table>
+
+<h2>7. Network &amp; Timing</h2>
+<table>
+<tr><th style="width:24%">Setting</th><th style="width:38%">Value</th><th>Notes</th></tr>
+<tr><td>Backend</td><td><code>https://vemaphehzjnvspxmweeb.supabase.co</code></td><td>RPC <code>ingest_sensor_readings</code>; anon key in <code>secrets.h</code></td></tr>
+<tr><td>Upload timeout</td><td>15,000 ms</td><td></td></tr>
+<tr><td>Reading interval</td><td>Every 2 s (continuous mode)</td><td>Deep sleep currently off (<code>ENABLE_DEEP_SLEEP = 0</code>)</td></tr>
+<tr><td>Upload interval</td><td>Once per 60 s</td><td>First reading after boot uploads immediately</td></tr>
+<tr><td>Offline storage</td><td>Up to 10,080 readings</td><td>Kept in flash and uploaded in batches of 50 when back online</td></tr>
+<tr><td>Wi-Fi setup</td><td>Hotspot <code>IsdaSafe-XXXX</code></td><td>Password <code>isdasafe</code>; opens when no saved network works, or hold BOOT 3 s. Also settable over USB (<code>WIFI …</code> commands).</td></tr>
+<tr><td>Pairing</td><td>QR claim or <code>PAIR</code> over USB</td><td>Device must be paired before uploads are accepted</td></tr>
+</table>
+
+<h2>8. Required Libraries</h2>
+<table>
+<tr><th style="width:40%">Library</th><th>Used For</th></tr>
+<tr><td><code>Adafruit ADS1X15</code></td><td>ADS1115 16-bit ADC (dissolved oxygen)</td></tr>
+<tr><td><code>LiquidCrystal I2C</code> (Frank de Brabander)</td><td>16×2 LCD</td></tr>
+<tr><td><code>DHT sensor library</code> + <code>Adafruit Unified Sensor</code></td><td>DHT22 air temperature &amp; humidity</td></tr>
+<tr><td>ESP32 core (<code>WiFi</code>, <code>WiFiClientSecure</code>, <code>HTTPClient</code>, <code>WebServer</code>, <code>DNSServer</code>, <code>Preferences</code>, <code>LittleFS</code>)</td><td>Networking, setup hotspot, saved settings, offline queue (no separate install)</td></tr>
+</table>
+</body></html>

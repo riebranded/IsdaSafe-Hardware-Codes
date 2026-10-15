@@ -1,0 +1,8 @@
+# Local WiFi credentials and API keys
+secrets.h
+
+# Printed QR stickers contain claim codes
+tools/stickers/
+
+# Arduino build output
+build/
